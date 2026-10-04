@@ -1045,6 +1045,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.LLMClient = exports.ToolsUnsupportedError = void 0;
 const openai_1 = __nccwpck_require__(2583);
+const node_net_1 = __nccwpck_require__(7030);
 const review_schema_1 = __nccwpck_require__(665);
 const config_1 = __nccwpck_require__(4008);
 const llm_retry_1 = __nccwpck_require__(4069);
@@ -1052,12 +1053,123 @@ const llm_provider_1 = __nccwpck_require__(710);
 const core = __importStar(__nccwpck_require__(7484));
 /** The provider or model cannot take `tools`; callers should fall back to a plain completion. */
 class ToolsUnsupportedError extends Error {
-    constructor(cause) {
-        super(`Model does not support tool calling: ${(0, llm_retry_1.errorMessage)(cause)}`);
+    constructor(cause, sensitiveValue) {
+        const message = (0, llm_retry_1.errorMessage)(cause);
+        super(`Model does not support tool calling: ${sensitiveValue ? message.split(sensitiveValue).join("[REDACTED]") : message}`);
         this.name = "ToolsUnsupportedError";
     }
 }
 exports.ToolsUnsupportedError = ToolsUnsupportedError;
+function isLoopbackHostname(hostname) {
+    const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    if (host === "localhost")
+        return true;
+    const ipVersion = (0, node_net_1.isIP)(host);
+    return (ipVersion === 4 && host.startsWith("127.")) || (ipVersion === 6 && host === "::1");
+}
+function redactAccessSecret(value, secret) {
+    return value.split(secret).join("[REDACTED]");
+}
+function redactAccessSecretValue(value, secret) {
+    if (typeof value === "string")
+        return redactAccessSecret(value, secret);
+    if (Array.isArray(value))
+        return value.map((item) => redactAccessSecretValue(item, secret));
+    if (typeof value === "object" && value !== null) {
+        // Keep response order; if redaction maps two keys to the same key, the later entry wins.
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+            redactAccessSecret(key, secret),
+            redactAccessSecretValue(item, secret),
+        ]));
+    }
+    return value;
+}
+/** Scrub echoed credentials incrementally, retaining only a possible cross-chunk token prefix. */
+function redactAccessSecretStream(stream, secret) {
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let carry = "";
+    return stream.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+            const combined = carry + decoder.decode(chunk, { stream: true });
+            let possibleSecretPrefixLength = 0;
+            const maxPrefixLength = Math.min(secret.length - 1, combined.length);
+            for (let length = maxPrefixLength; length > 0; length -= 1) {
+                if (secret.startsWith(combined.slice(-length))) {
+                    possibleSecretPrefixLength = length;
+                    break;
+                }
+            }
+            const boundary = combined.length - possibleSecretPrefixLength;
+            const ready = redactAccessSecret(combined.slice(0, boundary), secret);
+            if (ready)
+                controller.enqueue(encoder.encode(ready));
+            carry = combined.slice(boundary);
+        },
+        flush(controller) {
+            const finalText = redactAccessSecret(carry + decoder.decode(), secret);
+            if (finalText)
+                controller.enqueue(encoder.encode(finalText));
+        },
+    }));
+}
+/** Redact debug-visible response headers and bodies while leaving SSE delivery incremental. */
+function redactAccessSecretResponse(response, secret) {
+    const responseHeaders = new Headers(response.headers);
+    const headers = new Headers();
+    let redactedHeaderIndex = 0;
+    responseHeaders.forEach((value, name) => {
+        // Header names are case-insensitive and constrained to token characters, so use a
+        // valid replacement name instead of inserting the `[REDACTED]` marker.
+        let sanitizedName = name;
+        if (name.toLowerCase().includes(secret.toLowerCase())) {
+            do {
+                sanitizedName = `x-robin-redacted-header-${redactedHeaderIndex++}`;
+            } while (responseHeaders.has(sanitizedName) || headers.has(sanitizedName));
+        }
+        headers.append(sanitizedName, redactAccessSecret(value, secret));
+    });
+    let redactedBody;
+    let bodyInitialized = false;
+    return new Proxy(response, {
+        get(target, property) {
+            if (property === "headers")
+                return headers;
+            if (property === "body") {
+                if (!bodyInitialized) {
+                    const body = target.body;
+                    redactedBody = body ? redactAccessSecretStream(body, secret) : null;
+                    bodyInitialized = true;
+                }
+                return redactedBody;
+            }
+            if (property === "json") {
+                return async () => redactAccessSecretValue(await target.json(), secret);
+            }
+            if (property === "text") {
+                return async () => redactAccessSecret(await target.text(), secret);
+            }
+            if (property === "clone") {
+                return () => redactAccessSecretResponse(target.clone(), secret);
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    });
+}
+function makeCloudflareAccessFetch(clientId, clientSecret) {
+    const accessFetch = (url, init) => {
+        const requestInit = init;
+        const headers = new Headers(requestInit?.headers);
+        headers.set("CF-Access-Client-Id", clientId);
+        headers.set("CF-Access-Client-Secret", clientSecret);
+        // OpenAI's default fetch follows cross-origin redirects without stripping custom
+        // headers. A configured Access token must only reach the configured LLM endpoint.
+        return fetch(String(url), { ...requestInit, headers, redirect: "error" })
+            .then((response) => redactAccessSecretResponse(response, clientSecret));
+    };
+    return accessFetch;
+}
 class LLMClient {
     client;
     model;
@@ -1068,6 +1180,7 @@ class LLMClient {
     temperature;
     onProgress;
     reasoningEffort;
+    cloudflareAccessClientSecret;
     reasoningFallbackActive = false;
     reasoningFallbackReason;
     /** Request-shape compatibility state; adjusted once per rejected parameter and kept for the run. */
@@ -1076,7 +1189,7 @@ class LLMClient {
     responseFormat = "json_schema";
     tokenLimitParam = "max_tokens";
     droppedParams = [];
-    constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort) {
+    constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort, cfAccessClientId, cfAccessClientSecret) {
         this.model = model;
         this.temperature = temperature;
         this.routerModel = (0, llm_retry_1.isOpenRouterRouterModel)(model);
@@ -1090,6 +1203,27 @@ class LLMClient {
         const effectiveTimeoutMs = (0, llm_retry_1.resolveLlmTimeoutMs)(model, timeoutMs);
         const normalizedBaseUrl = (0, llm_provider_1.normalizeLlmBaseUrl)(baseUrl);
         this.provider = (0, llm_provider_1.detectLlmProvider)(normalizedBaseUrl);
+        const accessClientId = cfAccessClientId?.trim() || undefined;
+        const accessClientSecret = cfAccessClientSecret?.trim() || undefined;
+        if (Boolean(accessClientId) !== Boolean(accessClientSecret)) {
+            throw new Error("Cloudflare Access requires both cf-access-client-id and cf-access-client-secret to be configured together.");
+        }
+        if (accessClientId && accessClientSecret) {
+            let endpoint;
+            try {
+                endpoint = new URL(normalizedBaseUrl);
+            }
+            catch {
+                // The OpenAI SDK will report malformed URLs when credentials are not configured;
+                // with credentials, fail closed because the transport cannot be checked safely.
+            }
+            if (!endpoint ||
+                (endpoint.protocol !== "https:" &&
+                    !(endpoint.protocol === "http:" && isLoopbackHostname(endpoint.hostname)))) {
+                throw new Error("Cloudflare Access service tokens require an https:// LLM base URL; http://localhost and loopback addresses are allowed for local testing.");
+            }
+            this.cloudflareAccessClientSecret = accessClientSecret;
+        }
         if (normalizedBaseUrl !== baseUrl.trim()) {
             core.info(`Normalized LLM base URL: ${baseUrl} -> ${normalizedBaseUrl}`);
         }
@@ -1100,6 +1234,9 @@ class LLMClient {
             apiKey: apiKey || "ollama",
             maxRetries: 0,
             timeout: effectiveTimeoutMs,
+            ...(accessClientId && accessClientSecret
+                ? { fetch: makeCloudflareAccessFetch(accessClientId, accessClientSecret) }
+                : {}),
         });
         if (this.routerModel) {
             core.info(`OpenRouter router model — ${config_1.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS / 1000}s first-chunk stall detect, ${effectiveTimeoutMs / 1000}s stream cap, provider fallbacks.`);
@@ -1144,7 +1281,7 @@ class LLMClient {
         // mode to step down to; rely on the prompt and the markdown fallback parser instead.
         if (param === "response_format" && this.responseFormat === "json_schema" && this.provider !== "anthropic") {
             this.responseFormat = "json_object";
-            core.warning(`Provider rejected the JSON schema response_format (${(0, llm_retry_1.errorMessage)(error)}). Retrying once with plain JSON-object mode and keeping that shape for the rest of this run.`);
+            core.warning(`Provider rejected the JSON schema response_format (${this.safeErrorMessage(error)}). Retrying once with plain JSON-object mode and keeping that shape for the rest of this run.`);
             return true;
         }
         if (this.droppedParams.includes(param))
@@ -1164,7 +1301,7 @@ class LLMClient {
                 if (this.droppedParams.includes(other)) {
                     // Both spellings have now been rejected. Never fall back to an uncapped request for a
                     // configured cap — surface the provider's error instead.
-                    core.error(`Provider rejected both max_tokens and max_completion_tokens (${(0, llm_retry_1.errorMessage)(error)}). ` +
+                    core.error(`Provider rejected both max_tokens and max_completion_tokens (${this.safeErrorMessage(error)}). ` +
                         "The configured max-output-tokens cap cannot be enforced on this endpoint, so the request is not sent uncapped.");
                     return false;
                 }
@@ -1178,7 +1315,7 @@ class LLMClient {
                 action = "omitting response_format (the review parser falls back to markdown)";
                 break;
         }
-        core.warning(`Provider rejected the ${param} parameter (${(0, llm_retry_1.errorMessage)(error)}). Retrying once ${action} and keeping that shape for the rest of this run.`);
+        core.warning(`Provider rejected the ${param} parameter (${this.safeErrorMessage(error)}). Retrying once ${action} and keeping that shape for the rest of this run.`);
         return true;
     }
     retryContext() {
@@ -1235,27 +1372,33 @@ class LLMClient {
             catch (error) {
                 lastError = error;
                 if (options.tools && (0, llm_retry_1.isToolsUnsupportedError)(error)) {
-                    throw new ToolsUnsupportedError(error);
+                    throw new ToolsUnsupportedError(error, this.cloudflareAccessClientSecret);
                 }
-                core.warning(`LLM attempt ${attempt}/${this.maxAttempts} failed: ${error}`);
+                core.warning(`LLM attempt ${attempt}/${this.maxAttempts} failed: ${this.safeErrorMessage(error)}`);
                 if (!(0, llm_retry_1.isRetriableLlmError)(error, this.retryContext()) || attempt === this.maxAttempts) {
-                    core.error(`LLM API error: ${error}`);
-                    throw new Error(`Failed to get response from LLM: ${error}`);
+                    core.error(`LLM API error: ${this.safeErrorMessage(error)}`);
+                    throw new Error(`Failed to get response from LLM: ${this.safeErrorMessage(error)}`);
                 }
             }
             if (attempt < this.maxAttempts) {
                 const waitMs = (0, llm_retry_1.computeRetryDelayMs)(attempt, this.retryContext());
-                const reason = lastError instanceof Error ? lastError.message : "empty response";
+                const reason = lastError instanceof Error ? this.safeErrorMessage(lastError) : "empty response";
                 core.info(`Retrying LLM request in ${waitMs} ms (attempt ${attempt + 1}/${this.maxAttempts})...`);
                 await this.progress(`Attempt ${attempt} did not succeed (${reason}). Retrying in ${Math.round(waitMs / 1000)}s…`);
                 await (0, llm_retry_1.delayMs)(waitMs);
             }
         }
         if (lastError && (0, llm_retry_1.isRetriableLlmError)(lastError, this.retryContext())) {
-            core.error(`LLM API error after ${this.maxAttempts} attempts: ${lastError}`);
-            throw new Error(`Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`);
+            core.error(`LLM API error after ${this.maxAttempts} attempts: ${this.safeErrorMessage(lastError)}`);
+            throw new Error(`Failed to get response from LLM after ${this.maxAttempts} attempts: ${this.safeErrorMessage(lastError)}`);
         }
         throw new Error(`Empty response from LLM after ${this.maxAttempts} attempts (finish_reason=${lastFinishReason})`);
+    }
+    safeErrorMessage(error) {
+        const message = (0, llm_retry_1.errorMessage)(error);
+        return this.cloudflareAccessClientSecret
+            ? redactAccessSecret(message, this.cloudflareAccessClientSecret)
+            : message;
     }
     /**
      * One completion request. If the provider rejects an optional part of the request —
@@ -1292,7 +1435,7 @@ class LLMClient {
             return false;
         this.reasoningFallbackActive = true;
         this.reasoningFallbackReason = fallbackReason;
-        core.warning(`Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${(0, llm_retry_1.errorMessage)(error)}). ` +
+        core.warning(`Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${this.safeErrorMessage(error)}). ` +
             "Retrying once without the reasoning parameter and continuing this run without reasoning controls.");
         await this.progress(fallbackReason === "invalid-value"
             ? "Provider rejected the configured reasoning effort — retrying without it…"
@@ -2053,6 +2196,12 @@ async function run() {
         }
         const apiKey = core.getInput("llm-api-key") || "ollama";
         const baseUrl = core.getInput("llm-base-url") || "";
+        const cfAccessClientId = core.getInput("cf-access-client-id") || "";
+        const cfAccessClientSecret = core.getInput("cf-access-client-secret") || "";
+        if (cfAccessClientId)
+            core.setSecret(cfAccessClientId);
+        if (cfAccessClientSecret)
+            core.setSecret(cfAccessClientSecret);
         const model = core.getInput("model") || "";
         const failOnHigh = core.getInput("fail-on-high") === "true";
         const maxDiffSizeInput = core.getInput("max-diff-size") || "50000";
@@ -2166,7 +2315,7 @@ async function run() {
         const reviewInstructions = command === "review"
             ? await loadReviewInstructions(octokit, gitUtils, owner, repo, prNumber, inlineReviewInstructions, reviewInstructionsFile, baseRef)
             : "";
-        const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, undefined, llmTemperature, (detail) => reporter?.setProvider(detail), reasoningEffort);
+        const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, undefined, llmTemperature, (detail) => reporter?.setProvider(detail), reasoningEffort, cfAccessClientId, cfAccessClientSecret);
         const useJsonMode = command === "review" && jsonResponseMode;
         // Only a user-configured effort earns a PR-visible "fix your config" notice; a rejected
         // default falls back quietly in the logs.

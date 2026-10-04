@@ -23,6 +23,8 @@ const ACTION_ONLY_SECRETS = new Set([
   "github-token",
   "llm-api-key",
   "llm-base-url",
+  "cf-access-client-id",
+  "cf-access-client-secret",
   "model",
 ]);
 
@@ -148,6 +150,19 @@ describe("reusable review workflow", () => {
 
     for (const name of publicActionInputs()) {
       expect(reviewWorkflow).toContain(`${name}: \${{ inputs.${name} }}`);
+    }
+  });
+
+  it("forwards optional Cloudflare Access service-token secrets only to the LLM action", () => {
+    for (const [secret, input] of [
+      ["CF_ACCESS_CLIENT_ID", "cf-access-client-id"],
+      ["CF_ACCESS_CLIENT_SECRET", "cf-access-client-secret"],
+    ]) {
+      expect(reviewWorkflow).toContain(`      ${secret}:\n`);
+      expect(reviewWorkflow).toContain(`        required: false`);
+      expect(reviewWorkflow).toContain(`${input}: \${{ secrets.${secret} }}`);
+      expect(workflowCallInputNames(reviewWorkflow)).not.toContain(input);
+      expect(robinTemplate).toContain(`${secret}: \${{ secrets.${secret} }}`);
     }
   });
 

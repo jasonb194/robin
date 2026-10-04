@@ -110,6 +110,54 @@ describe("LLMClient provider-aware request shape", () => {
     expect(sdk.baseURL).toBe("http://my-server:11434/v1");
   });
 
+  it("omits Cloudflare Access headers when service-token inputs are absent", () => {
+    const client = new LLMClient("https://example.test/v1", "key", "model");
+    const options = (client as unknown as { client: { _options: { defaultHeaders?: Record<string, string> } } }).client._options;
+    expect(options.defaultHeaders).toBeUndefined();
+  });
+
+  it("injects both Cloudflare Access service-token headers at fetch time", () => {
+    const client = new LLMClient(
+      "https://example.test/v1", "key", "model", undefined, undefined, undefined,
+      undefined, undefined, undefined, " client-id ", " client-secret "
+    );
+    const options = (client as unknown as {
+      client: { _options: { defaultHeaders?: Record<string, string>; fetch?: unknown } };
+    }).client._options;
+    expect(options.defaultHeaders).toBeUndefined();
+    expect(options.fetch).toEqual(expect.any(Function));
+  });
+
+  it.each([
+    ["client ID only", "client-id", ""],
+    ["client secret only", "", "client-secret"],
+  ])("rejects partial Cloudflare Access configuration (%s)", (_case, clientId, clientSecret) => {
+    expect(
+      () => new LLMClient(
+        "https://example.test/v1", "key", "model", undefined, undefined, undefined,
+        undefined, undefined, undefined, clientId, clientSecret
+      )
+    ).toThrow("Cloudflare Access requires both cf-access-client-id and cf-access-client-secret");
+  });
+
+  it("requires HTTPS for Cloudflare Access credentials outside loopback", () => {
+    expect(
+      () => new LLMClient(
+        "http://api.example.test/v1", "key", "model", undefined, undefined, undefined,
+        undefined, undefined, undefined, "client-id", "client-secret"
+      )
+    ).toThrow("Cloudflare Access service tokens require an https:// LLM base URL");
+  });
+
+  it("allows localhost HTTP endpoints for Cloudflare Access local testing", () => {
+    expect(
+      () => new LLMClient(
+        "http://localhost:11434/v1", "key", "model", undefined, undefined, undefined,
+        undefined, undefined, undefined, "client-id", "client-secret"
+      )
+    ).not.toThrow();
+  });
+
   it("sends OpenAI-native reasoning_effort to api.openai.com", () => {
     const client = makeClient("https://api.openai.com/v1", "gpt-4o", { effort: "high" });
     const request = buildRequest(client);

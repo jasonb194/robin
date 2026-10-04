@@ -30,7 +30,7 @@ Add Robin to this repository.
 - Workflow file: .github/workflows/robin.yml
 - Reusable workflow: antongulin/robin/.github/workflows/review.yml@main
 - Action ref if needed: antongulin/robin@main
-- Secrets: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+- Secrets: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL; optional CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET for Cloudflare Access-protected endpoints
 - Do NOT use @v0 or any v0 tag
 - Do NOT use pull_request_target
 Read AGENTS.md in the robin repo for full rules.
@@ -92,6 +92,18 @@ The easiest free setup uses [OpenRouter](https://openrouter.ai/):
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` |
 | `LLM_MODEL` | `openrouter/free` |
 
+If the endpoint uses Cloudflare Access, also create the optional GitHub Actions secrets
+`CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`. Set both; Robin sends them as
+`CF-Access-Client-Id` and `CF-Access-Client-Secret` headers on LLM requests. Leave both
+unset when the endpoint does not use Cloudflare Access. Create a [Cloudflare Access service
+token](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/)
+and configure an Access application and policy for your proxy to require it; the headers
+only authenticate Robin's requests and do not enable Access protection on the proxy by
+themselves. Use an `https://` LLM base URL when Access credentials are configured; plain
+HTTP is allowed only for `localhost` and loopback addresses used for local testing. The
+reusable workflow example in Step 3 forwards both GitHub secrets to the action. If only
+one is configured, Robin stops with an error before making an LLM request.
+
 > [!TIP]
 > `openrouter/free` picks a free model for each review — **$0 from OpenRouter**. OpenRouter rotates which model runs; **leave this secret as `openrouter/free`** — the action retries and uses provider fallbacks when a route is temporarily unavailable. You only spend [GitHub Actions](https://docs.github.com/en/billing/concepts/product-billing/github-actions) minutes while the job runs (often a few minutes per review).
 >
@@ -141,6 +153,8 @@ jobs:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 ```
 
 Commit and push. Open a pull request — you should see a review within a few minutes.

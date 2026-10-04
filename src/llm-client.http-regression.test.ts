@@ -6,6 +6,8 @@ jest.mock("@actions/core", () => ({
 
 import * as http from "http";
 import { AddressInfo } from "net";
+import { inspect } from "node:util";
+import * as core from "@actions/core";
 import { LLMClient } from "./llm-client";
 
 /**
@@ -22,20 +24,32 @@ type Body = Record<string, unknown>;
 interface Gateway {
   baseUrl: string;
   requests: Body[];
+  requestHeaders: Record<string, string | string[] | undefined>[];
   close: () => Promise<void>;
 }
 
-function startGateway(handler: (body: Body) => { status: number; body: unknown }): Promise<Gateway> {
+interface GatewayResponse {
+  status: number;
+  body: unknown;
+  headers?: Record<string, string>;
+}
+
+function startGateway(handler: (body: Body) => GatewayResponse): Promise<Gateway> {
   const requests: Body[] = [];
+  const requestHeaders: Record<string, string | string[] | undefined>[] = [];
   const server = http.createServer((req, res) => {
+    requestHeaders.push(req.headers);
     const chunks: Buffer[] = [];
     req.on("data", (chunk) => chunks.push(chunk as Buffer));
     req.on("end", () => {
       const parsed = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
       requests.push(parsed);
-      const { status, body } = handler(parsed);
-      res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify(body));
+      const { status, body, headers = {} } = handler(parsed);
+      res.writeHead(status, {
+        "content-type": typeof body === "string" ? "text/plain" : "application/json",
+        ...headers,
+      });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
     });
   });
 
@@ -45,12 +59,26 @@ function startGateway(handler: (body: Body) => { status: number; body: unknown }
       resolve({
         baseUrl: `http://127.0.0.1:${port}/v1`,
         requests,
+        requestHeaders,
         close: () =>
           new Promise<void>((done) => {
             server.close(() => done());
           }),
       });
     });
+  });
+}
+
+function listen(server: http.Server): Promise<AddressInfo> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve(server.address() as AddressInfo));
+  });
+}
+
+function close(server: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
   });
 }
 
@@ -90,7 +118,376 @@ function makeClient(baseUrl: string, model: string, maxOutputTokens: number): LL
 const hasAnyTokenField = (body: Body) =>
   body.max_tokens !== undefined || body.max_completion_tokens !== undefined;
 
+function debugOutput(debugLog: jest.SpyInstance): string {
+  return debugLog.mock.calls
+    .map((args: unknown[]) => args.map((arg) => inspect(arg, { depth: null })).join(" "))
+    .join("\n");
+}
+
 describe("max-output-tokens compatibility (real local endpoint)", () => {
+  it("sends Cloudflare Access service-token headers on LLM requests", async () => {
+    const gateway = await startGateway(() => completion("test-model"));
+    const originalDebug = process.env.DEBUG;
+    process.env.DEBUG = "true";
+    const debugLog = jest.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      jest.clearAllMocks();
+      const client = new LLMClient(
+        gateway.baseUrl,
+        "test-key",
+        "test-model",
+        undefined,
+        undefined,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        "cf-client-secret"
+      );
+      await client.chatCompletion("system", "user");
+      await client.chatWithTools([
+        { role: "system", content: "system" },
+        { role: "user", content: "user" },
+      ], []);
+
+      expect(gateway.requestHeaders).toHaveLength(2);
+      for (const headers of gateway.requestHeaders) {
+        expect(headers["cf-access-client-id"]).toBe("cf-client-id");
+        expect(headers["cf-access-client-secret"]).toBe("cf-client-secret");
+      }
+      expect(debugOutput(debugLog)).not.toContain("cf-client-secret");
+    } finally {
+      debugLog.mockRestore();
+      if (originalDebug === undefined) delete process.env.DEBUG;
+      else process.env.DEBUG = originalDebug;
+      await gateway.close();
+    }
+  });
+
+  it("does not forward Cloudflare Access headers across a redirect", async () => {
+    const targetHeaders: Record<string, string | string[] | undefined>[] = [];
+    const target = http.createServer((req, res) => {
+      targetHeaders.push(req.headers);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(completion("test-model").body));
+    });
+    const targetAddress = await listen(target);
+    const targetUrl = `http://127.0.0.1:${targetAddress.port}/v1/chat/completions`;
+    const redirect = http.createServer((_req, res) => {
+      res.writeHead(307, { location: targetUrl });
+      res.end();
+    });
+    const redirectAddress = await listen(redirect);
+
+    try {
+      const client = new LLMClient(
+        `http://127.0.0.1:${redirectAddress.port}/v1`,
+        "test-key",
+        "test-model",
+        undefined,
+        undefined,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        "cf-client-secret"
+      );
+      await expect(client.chatCompletion("system", "user")).rejects.toThrow(
+        "Failed to get response from LLM"
+      );
+      expect(targetHeaders).toHaveLength(0);
+    } finally {
+      await Promise.all([close(redirect), close(target)]);
+    }
+  });
+
+  it("sends Cloudflare Access headers while consuming a successful SSE stream without buffering", async () => {
+    const requestHeaders: Record<string, string | string[] | undefined>[] = [];
+    let releaseResponse: () => void = () => {};
+    let signalFirstChunk: () => void = () => {};
+    const responseGate = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const firstChunkProgress = new Promise<void>((resolve) => {
+      signalFirstChunk = resolve;
+    });
+    const server = http.createServer((req, res) => {
+      requestHeaders.push(req.headers);
+      req.resume();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-chunk-1",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "routed-model",
+          choices: [{ index: 0, delta: { content: "streamed " }, finish_reason: null }],
+        })}\n\n`
+      );
+      void responseGate.then(() => {
+        res.write(
+          `data: ${JSON.stringify({
+            id: "chatcmpl-chunk-2",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "routed-model",
+            choices: [{ index: 0, delta: { content: "review" }, finish_reason: null }],
+          })}\n\n`
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            id: "chatcmpl-chunk-3",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "routed-model",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          })}\n\n`
+        );
+        res.end("data: [DONE]\n\n");
+      });
+    });
+    const address = await listen(server);
+    let sawFirstChunk = false;
+
+    try {
+      const client = new LLMClient(
+        `http://127.0.0.1:${address.port}/v1`,
+        "test-key",
+        "openrouter/free",
+        undefined,
+        10000,
+        1,
+        undefined,
+        (detail) => {
+          if (detail.includes("generating review")) {
+            sawFirstChunk = true;
+            signalFirstChunk();
+            releaseResponse();
+          }
+        },
+        undefined,
+        "cf-client-id",
+        "cf-client-secret"
+      );
+
+      const request = client.chatCompletion("system", "user");
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const firstChunkWithinTimeout = await Promise.race([
+        firstChunkProgress.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), 5000);
+        }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      if (!firstChunkWithinTimeout) releaseResponse();
+
+      const result = await request;
+      expect(firstChunkWithinTimeout).toBe(true);
+      expect(sawFirstChunk).toBe(true);
+      expect(result.content).toBe("streamed review");
+      expect(requestHeaders).toHaveLength(1);
+      expect(requestHeaders[0]["cf-access-client-id"]).toBe("cf-client-id");
+      expect(requestHeaders[0]["cf-access-client-secret"]).toBe("cf-client-secret");
+    } finally {
+      releaseResponse();
+      await close(server);
+    }
+  }, 15000);
+
+  it("redacts an echoed secret split across malformed SSE chunks before SDK error logs", async () => {
+    const secret = "cf-client-secret";
+    const requestHeaders: Record<string, string | string[] | undefined>[] = [];
+    const server = http.createServer((req, res) => {
+      requestHeaders.push(req.headers);
+      req.resume();
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "x-echoed-access-token": secret,
+      });
+      const splitAt = 7;
+      res.write(`data: Access token rejected: ${secret.slice(0, splitAt)}`);
+      setTimeout(() => res.end(`${secret.slice(splitAt)}\n\n`), 10);
+    });
+    const address = await listen(server);
+    const originalDebug = process.env.DEBUG;
+    process.env.DEBUG = "true";
+    const debugLog = jest.spyOn(console, "log").mockImplementation(() => {});
+    const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const client = new LLMClient(
+        `http://127.0.0.1:${address.port}/v1`,
+        "test-key",
+        "openrouter/free",
+        undefined,
+        5000,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        secret
+      );
+      const error = await client.chatCompletion("system", "user").then(
+        () => {
+          throw new Error("Expected the malformed SSE event to fail");
+        },
+        (reason: unknown) => reason as Error
+      );
+      const debugLogs = debugOutput(debugLog);
+      const parserErrors = debugOutput(errorLog);
+
+      expect(error.message).not.toContain(secret);
+      expect(requestHeaders).toHaveLength(1);
+      expect(requestHeaders[0]["cf-access-client-secret"]).toBe(secret);
+      expect(debugLogs).toContain("[REDACTED]");
+      expect(debugLogs).not.toContain(secret);
+      expect(parserErrors).toContain("[REDACTED]");
+      expect(parserErrors).not.toContain(secret);
+    } finally {
+      debugLog.mockRestore();
+      errorLog.mockRestore();
+      if (originalDebug === undefined) delete process.env.DEBUG;
+      else process.env.DEBUG = originalDebug;
+      await close(server);
+    }
+  });
+
+  it("redacts an echoed Cloudflare Access secret from LLM errors and logs", async () => {
+    const secret = "cf-client-secret";
+    const gateway = await startGateway(() => ({
+      status: 401,
+      body: { error: { message: `Access token rejected: ${secret}` } },
+    }));
+    try {
+      jest.clearAllMocks();
+      const client = new LLMClient(
+        gateway.baseUrl,
+        "test-key",
+        "test-model",
+        undefined,
+        undefined,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        secret
+      );
+      const error = await client.chatCompletion("system", "user").then(
+        () => {
+          throw new Error("Expected the rejected LLM request to throw");
+        },
+        (reason: unknown) => reason as Error
+      );
+
+      expect(error.message).toContain("[REDACTED]");
+      expect(error.message).not.toContain(secret);
+      const logs = [
+        ...(core.warning as jest.Mock).mock.calls,
+        ...(core.error as jest.Mock).mock.calls,
+      ].flat().join(" ");
+      expect(logs).not.toContain(secret);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("redacts echoed secrets from SDK debug response values, keys, and headers", async () => {
+    const secret = "cf-client-secret";
+    const response = completion("test-model", `Provider echoed ${secret}`);
+    const responseBody = response.body as unknown as {
+      choices: Array<{ message: Record<string, unknown> }>;
+    };
+    responseBody.choices[0].message[secret] = "earlier colliding property";
+    responseBody.choices[0].message["[REDACTED]"] = "later colliding property";
+    const gateway = await startGateway(() => ({
+      ...response,
+      headers: { "x-echoed-access-token": secret, [secret]: "echoed in header name" },
+    }));
+    const originalDebug = process.env.DEBUG;
+    process.env.DEBUG = "true";
+    const debugLog = jest.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const client = new LLMClient(
+        gateway.baseUrl,
+        "test-key",
+        "test-model",
+        undefined,
+        undefined,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        secret
+      );
+      const result = await client.chatCompletion("system", "user");
+      const logs = debugOutput(debugLog);
+
+      expect(result.content).toBe("Provider echoed [REDACTED]");
+      expect(logs).toContain("x-echoed-access-token");
+      expect(logs).toContain("x-robin-redacted-header-0");
+      expect(logs).toContain("[REDACTED]");
+      expect(logs).toContain("later colliding property");
+      expect(logs).not.toContain("earlier colliding property");
+      expect(logs).not.toContain(secret);
+    } finally {
+      debugLog.mockRestore();
+      if (originalDebug === undefined) delete process.env.DEBUG;
+      else process.env.DEBUG = originalDebug;
+      await gateway.close();
+    }
+  });
+
+  it("redacts echoed secrets from SDK debug output for non-JSON error bodies", async () => {
+    const secret = "cf-client-secret";
+    const gateway = await startGateway(() => ({
+      status: 401,
+      body: `Access token rejected: ${secret}`,
+      headers: { "x-echoed-access-token": secret },
+    }));
+    const originalDebug = process.env.DEBUG;
+    process.env.DEBUG = "true";
+    const debugLog = jest.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const client = new LLMClient(
+        gateway.baseUrl,
+        "test-key",
+        "test-model",
+        undefined,
+        undefined,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        secret
+      );
+      const error = await client.chatCompletion("system", "user").then(
+        () => {
+          throw new Error("Expected the rejected LLM request to throw");
+        },
+        (reason: unknown) => reason as Error
+      );
+      const logs = debugOutput(debugLog);
+
+      expect(error.message).toContain("[REDACTED]");
+      expect(error.message).not.toContain(secret);
+      expect(logs).toContain("[REDACTED]");
+      expect(logs).not.toContain(secret);
+    } finally {
+      debugLog.mockRestore();
+      if (originalDebug === undefined) delete process.env.DEBUG;
+      else process.env.DEBUG = originalDebug;
+      await gateway.close();
+    }
+  });
+
   it("keeps the cap by switching to max_tokens on a max_tokens-only gateway (reasoning-family name)", async () => {
     const gateway = await startGateway((body) =>
       body.max_completion_tokens !== undefined

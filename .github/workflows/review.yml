@@ -101,6 +101,12 @@ on:
         required: true
       LLM_MODEL:
         required: true
+      CF_ACCESS_CLIENT_ID:
+        description: "Optional Cloudflare Access service token client ID for the LLM endpoint. Set together with CF_ACCESS_CLIENT_SECRET."
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        description: "Optional Cloudflare Access service token client secret for the LLM endpoint. Set together with CF_ACCESS_CLIENT_ID."
+        required: false
 
 permissions:
   actions: read # lets Robin detect when a cancelled run was superseded by a newer one
@@ -136,6 +142,8 @@ jobs:
           github-token: ${{ github.token }}
           llm-api-key: ${{ secrets.LLM_API_KEY }}
           llm-base-url: ${{ secrets.LLM_BASE_URL }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           model: ${{ secrets.LLM_MODEL }}
           fail-on-high: ${{ inputs.fail-on-high }}
           request-changes: ${{ inputs.request-changes }}

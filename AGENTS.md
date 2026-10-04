@@ -31,6 +31,8 @@ For a direct action step: `antongulin/robin@main` or `@v2`.
 | `LLM_API_KEY` | Provider API key |
 | `LLM_BASE_URL` | OpenAI-compatible base URL |
 | `LLM_MODEL` | Model id |
+| `CF_ACCESS_CLIENT_ID` | Optional Cloudflare Access service-token client ID for the LLM endpoint; set together with `CF_ACCESS_CLIENT_SECRET` |
+| `CF_ACCESS_CLIENT_SECRET` | Optional Cloudflare Access service-token client secret for the LLM endpoint; set together with `CF_ACCESS_CLIENT_ID` |
 
 Free OpenRouter example:
 
@@ -62,6 +64,8 @@ jobs:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 ```
 
 ## Permissions
