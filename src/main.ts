@@ -41,6 +41,11 @@ import { getReviewPrompt, getSummaryPrompt, getHelpMessage } from "./prompts/rev
 import { ReviewerCommand, hasRequiredPermission, parseSlashCommand } from "./commands";
 import { shouldSkipSynchronizeEvent } from "./trigger";
 
+/**
+ * Orchestrate eligible GitHub review events and status reporting. Mask configured
+ * Cloudflare credentials before passing them to the LLM client; skip unsupported or
+ * unauthorized triggers without starting a review.
+ */
 async function run(): Promise<void> {
   let octokit: ReturnType<typeof github.getOctokit> | undefined;
   let statusOwner = "";
@@ -140,6 +145,10 @@ async function run(): Promise<void> {
 
     const apiKey = core.getInput("llm-api-key") || "ollama";
     const baseUrl = core.getInput("llm-base-url") || "";
+    const cfAccessClientId = core.getInput("cf-access-client-id") || "";
+    const cfAccessClientSecret = core.getInput("cf-access-client-secret") || "";
+    if (cfAccessClientId) core.setSecret(cfAccessClientId);
+    if (cfAccessClientSecret) core.setSecret(cfAccessClientSecret);
     const model = core.getInput("model") || "";
     const failOnHigh = core.getInput("fail-on-high") === "true";
     const maxDiffSizeInput = core.getInput("max-diff-size") || "50000";
@@ -323,7 +332,9 @@ async function run(): Promise<void> {
       undefined,
       llmTemperature,
       (detail) => reporter?.setProvider(detail),
-      reasoningEffort
+      reasoningEffort,
+      cfAccessClientId,
+      cfAccessClientSecret
     );
     const useJsonMode = command === "review" && jsonResponseMode;
     // Only a user-configured effort earns a PR-visible "fix your config" notice; a rejected

@@ -109,13 +109,15 @@ jobs:
 
 ## All workflow inputs
 
-Available on the [direct action](../action.yml) and the [reusable workflow](../.github/workflows/review.yml), unless noted. LLM credentials are action inputs / reusable-workflow secrets respectively.
+Available on the [direct action](../action.yml) and the [reusable workflow](../.github/workflows/review.yml), unless noted. LLM credentials are action inputs / reusable-workflow secrets respectively. For Cloudflare Access-protected LLM endpoints, create a Cloudflare Access service token and configure an Access application and policy for the proxy to require it, then set both optional `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` secrets; Robin sends them as service-token headers only on LLM requests. The headers alone do not turn on Access protection. These credentials require an `https://` base URL; `http://localhost` and loopback addresses are allowed for local testing.
 
 | Input | Default | Description |
 | --- | --- | --- |
 | `github-token` | `${{ github.token }}` | Token for PR API and comments (direct action only; reusable workflow uses `github.token`) |
 | `llm-api-key` / `LLM_API_KEY` | `ollama` | Provider API key |
 | `llm-base-url` / `LLM_BASE_URL` | — | OpenAI-compatible base URL (required) |
+| `cf-access-client-id` / `CF_ACCESS_CLIENT_ID` | empty | Optional Cloudflare Access service-token client ID; set with its secret |
+| `cf-access-client-secret` / `CF_ACCESS_CLIENT_SECRET` | empty | Optional Cloudflare Access service-token client secret; set with its ID |
 | `model` / `LLM_MODEL` | — | Model name (required) |
 | `fail-on-high` | `false` | Fail the check if high-severity issues are found |
 | `request-changes` | omit → `true` (defer to repo config) | `true` submits a blocking REQUEST_CHANGES review on high findings; `false` posts a non-blocking COMMENT (advisor mode). Reusable workflow input is a boolean with no default — omit it to let `.github/robin.yml` win |

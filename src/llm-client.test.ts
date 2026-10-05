@@ -110,6 +110,70 @@ describe("LLMClient provider-aware request shape", () => {
     expect(sdk.baseURL).toBe("http://my-server:11434/v1");
   });
 
+  it("omits Cloudflare Access headers when service-token inputs are absent", () => {
+    const client = new LLMClient("https://example.test/v1", "key", "model");
+    const options = (client as unknown as { client: { _options: { defaultHeaders?: Record<string, string> } } }).client._options;
+    expect(options.defaultHeaders).toBeUndefined();
+  });
+
+  it("injects both Cloudflare Access service-token headers at fetch time", () => {
+    const client = new LLMClient(
+      "https://example.test/v1", "key", "model", undefined, undefined, undefined,
+      undefined, undefined, undefined, " client-id ", " client-secret "
+    );
+    const options = (client as unknown as {
+      client: { _options: { defaultHeaders?: Record<string, string>; fetch?: unknown } };
+    }).client._options;
+    expect(options.defaultHeaders).toBeUndefined();
+    expect(options.fetch).toEqual(expect.any(Function));
+  });
+
+  it.each([
+    ["client ID only", "client-id", ""],
+    ["client secret only", "", "client-secret"],
+  ])("rejects partial Cloudflare Access configuration (%s)", (_case, clientId, clientSecret) => {
+    expect(
+      () => new LLMClient(
+        "https://example.test/v1", "key", "model", undefined, undefined, undefined,
+        undefined, undefined, undefined, clientId, clientSecret
+      )
+    ).toThrow("Cloudflare Access requires both cf-access-client-id and cf-access-client-secret");
+  });
+
+  it("requires HTTPS for Cloudflare Access credentials outside loopback", () => {
+    expect(
+      () => new LLMClient(
+        "http://api.example.test/v1", "key", "model", undefined, undefined, undefined,
+        undefined, undefined, undefined, "client-id", "client-secret"
+      )
+    ).toThrow("Cloudflare Access service tokens require an https:// LLM base URL");
+  });
+
+  it("allows localhost HTTP endpoints for Cloudflare Access local testing", () => {
+    expect(
+      () => new LLMClient(
+        "http://localhost:11434/v1", "key", "model", undefined, undefined, undefined,
+        undefined, undefined, undefined, "client-id", "client-secret"
+      )
+    ).not.toThrow();
+  });
+
+  it("redacts both Cloudflare Access values in safe error messages", () => {
+    const clientId = "cf-client-id";
+    const clientSecret = "cf-client-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "model", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const safeErrorMessage = (client as unknown as {
+      safeErrorMessage(error: unknown): string;
+    }).safeErrorMessage(new Error(`Proxy rejected ${clientId}; secret was ${clientSecret}`));
+
+    expect(safeErrorMessage).toBe("Proxy rejected [REDACTED]; secret was [REDACTED]");
+    expect(safeErrorMessage).not.toContain(clientId);
+    expect(safeErrorMessage).not.toContain(clientSecret);
+  });
+
   it("sends OpenAI-native reasoning_effort to api.openai.com", () => {
     const client = makeClient("https://api.openai.com/v1", "gpt-4o", { effort: "high" });
     const request = buildRequest(client);
@@ -990,6 +1054,53 @@ describe("LLMClient tool calling", () => {
     ]);
   });
 
+  it("redacts credentials assembled across valid content deltas", async () => {
+    const clientId = "client-credential";
+    const clientSecret = "proxy-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "openrouter/free", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce(streamOf([
+      { model: "vendor/model", choices: [{ delta: { content: `leak: ${clientId.slice(0, 8)}` } }] },
+      { model: "vendor/model", choices: [{ delta: { content: `${clientId.slice(8)} and ${clientSecret}` } }] },
+    ]));
+
+    const result = await client.chatCompletion("system", "user");
+
+    expect(result.content).toBe("leak: [REDACTED] and [REDACTED]");
+    expect(result.model).toBe("vendor/model");
+  });
+
+  it("redacts credentials assembled across streamed tool-call fields", async () => {
+    const clientId = "client-credential";
+    const clientSecret = "proxy-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "openrouter/free", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce(streamOf([
+      {
+        model: "vendor/model",
+        choices: [{ delta: { tool_calls: [{ index: 0, id: clientId, function: { name: clientSecret.slice(0, 5), arguments: `{"value":"${clientId.slice(0, 7)}` } }] } }],
+      },
+      {
+        model: "vendor/model",
+        choices: [{ delta: { tool_calls: [{ index: 0, function: { name: clientSecret.slice(5), arguments: `${clientId.slice(7)} ${clientSecret}"}` } }] } }],
+      },
+    ]));
+
+    const result = await client.chatWithTools(messages, tools);
+
+    expect(result.toolCalls).toEqual([{
+      id: "[REDACTED]",
+      name: "[REDACTED]",
+      arguments: '{"value":"[REDACTED] [REDACTED]"}',
+    }]);
+  });
+
   it("throws ToolsUnsupportedError without retrying when a router has no tool-capable endpoint", async () => {
     const client = new LLMClient("https://openrouter.ai/api/v1", "k", "openrouter/free");
     const create = stubOpenAI(client);
@@ -1001,6 +1112,31 @@ describe("LLMClient tool calling", () => {
 
     await expect(client.chatWithTools(messages, tools)).rejects.toBeInstanceOf(ToolsUnsupportedError);
     expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("redacts both Cloudflare Access values from ToolsUnsupportedError", async () => {
+    const clientId = "cf-client-id";
+    const clientSecret = "cf-client-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "model", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const create = stubOpenAI(client);
+    create.mockRejectedValue(
+      Object.assign(new Error(`No endpoints found that support tool use: ${clientId} ${clientSecret}`), {
+        status: 404,
+      })
+    );
+
+    const error = await client.chatWithTools(messages, tools).then(
+      () => { throw new Error("Expected the unsupported-tools request to fail"); },
+      (reason: unknown) => reason as Error
+    );
+
+    expect(error).toBeInstanceOf(ToolsUnsupportedError);
+    expect(error.message).toContain("[REDACTED]");
+    expect(error.message).not.toContain(clientId);
+    expect(error.message).not.toContain(clientSecret);
   });
 
   it("keeps normal router 404 retries for plain completions", async () => {

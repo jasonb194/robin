@@ -17,6 +17,14 @@ inputs:
   llm-base-url:
     description: "Base URL for OpenAI-compatible API. Examples: https://api.openai.com/v1, http://your-server:11434/v1"
     required: true
+  cf-access-client-id:
+    description: "Optional Cloudflare Access service token client ID for your LLM endpoint. Set together with cf-access-client-secret."
+    required: false
+    default: ""
+  cf-access-client-secret:
+    description: "Optional Cloudflare Access service token client secret for your LLM endpoint. Set together with cf-access-client-id."
+    required: false
+    default: ""
   model:
     description: "Model name to use. Examples: gpt-4o, llama3.2, codellama:13b, or your provider-specific model name."
     required: true
