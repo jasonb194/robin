@@ -7,6 +7,7 @@ jest.mock("@actions/core", () => ({
 import * as http from "http";
 import { AddressInfo } from "net";
 import { inspect } from "node:util";
+import { getGlobalDispatcher, ProxyAgent, setGlobalDispatcher } from "undici-v6";
 import * as core from "@actions/core";
 import { LLMClient } from "./llm-client";
 
@@ -162,6 +163,48 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
       if (originalDebug === undefined) delete process.env.DEBUG;
       else process.env.DEBUG = originalDebug;
       await gateway.close();
+    }
+  });
+
+  it("bypasses the global proxy for credentialed loopback HTTP requests", async () => {
+    const gateway = await startGateway(() => completion("test-model"));
+    const proxyHeaders: Record<string, string | string[] | undefined>[] = [];
+    const proxy = http.createServer((req, res) => {
+      proxyHeaders.push(req.headers);
+      req.resume();
+      res.writeHead(502);
+      res.end("The global proxy must not receive this request.");
+    });
+    const proxyAddress = await listen(proxy);
+    const proxyDispatcher = new ProxyAgent(`http://127.0.0.1:${proxyAddress.port}`);
+    const originalDispatcher = getGlobalDispatcher();
+    setGlobalDispatcher(proxyDispatcher);
+
+    try {
+      const client = new LLMClient(
+        gateway.baseUrl,
+        "test-key",
+        "test-model",
+        undefined,
+        undefined,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        "cf-client-id",
+        "cf-client-secret"
+      );
+
+      await expect(client.chatCompletion("system", "user")).resolves.toMatchObject({
+        content: "review text",
+      });
+      expect(proxyHeaders).toHaveLength(0);
+      expect(gateway.requestHeaders).toHaveLength(1);
+      expect(gateway.requestHeaders[0]["cf-access-client-id"]).toBe("cf-client-id");
+      expect(gateway.requestHeaders[0]["cf-access-client-secret"]).toBe("cf-client-secret");
+    } finally {
+      setGlobalDispatcher(originalDispatcher);
+      await Promise.all([gateway.close(), close(proxy), proxyDispatcher.close()]);
     }
   });
 

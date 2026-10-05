@@ -1,5 +1,6 @@
 import { OpenAI, type ClientOptions } from "openai";
 import { isIP } from "node:net";
+import { Agent } from "undici-v6";
 import { REVIEW_JSON_SCHEMA } from "./prompts/review-schema";
 import {
   DEFAULT_LLM_COMPLETION_ATTEMPTS,
@@ -250,15 +251,25 @@ function makeCloudflareAccessFetch(
   clientId: string,
   clientSecret: string
 ): NonNullable<ClientOptions["fetch"]> {
+  // An explicit dispatcher keeps credentialed loopback HTTP requests off Node's
+  // environment-proxy-aware global dispatcher (added in Node 24).
+  const directLoopbackHttpAgent = new Agent();
   const accessFetch = (url: unknown, init?: unknown): Promise<Response> => {
     const requestInit = init as RequestInit | undefined;
     const headers = new Headers(requestInit?.headers as never);
     headers.set("CF-Access-Client-Id", clientId);
     headers.set("CF-Access-Client-Secret", clientSecret);
+    const requestUrl = new URL(String(url));
+    const dispatcher =
+      requestUrl.protocol === "http:" && isLoopbackHostname(requestUrl.hostname)
+        ? directLoopbackHttpAgent
+        : undefined;
 
     // OpenAI's default fetch follows cross-origin redirects without stripping custom
     // headers. A configured Access token must only reach the configured LLM endpoint.
-    return fetch(String(url), { ...requestInit, headers, redirect: "error" })
+    // For local HTTP endpoints, bypass the global dispatcher so an environment proxy
+    // cannot receive Access credentials even when NO_PROXY does not list loopback.
+    return fetch(String(url), { ...requestInit, headers, redirect: "error", dispatcher } as RequestInit)
       .then((response) => redactAccessSecretResponse(response, [clientId, clientSecret])) as unknown as ReturnType<
         NonNullable<ClientOptions["fetch"]>
       >;
@@ -630,6 +641,7 @@ export class LLMClient {
     }
   }
 
+  /** Record eligible reasoning rejections, then return whether the request should retry without the control. */
   private async applyReasoningFallback(error: unknown): Promise<boolean> {
     if (this.reasoningFallbackActive || !this.reasoningEffort || this.provider === "anthropic") {
       return false;
