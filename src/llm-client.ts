@@ -70,6 +70,7 @@ interface CompletionOptions {
 
 export type LlmProgressHandler = (detail: string) => void | Promise<void>;
 
+/** Recognize localhost, IPv4 127/8, and IPv6 ::1 literals as local-only hosts. */
 function isLoopbackHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost") return true;
@@ -77,6 +78,7 @@ function isLoopbackHostname(hostname: string): boolean {
   return (ipVersion === 4 && host.startsWith("127.")) || (ipVersion === 6 && host === "::1");
 }
 
+/** Redact longer configured credentials before shorter contained values can obscure a full match. */
 function redactAccessValues(value: string, sensitiveValues?: string | string[]): string {
   const values = (Array.isArray(sensitiveValues) ? sensitiveValues : [sensitiveValues])
     .filter((sensitiveValue): sensitiveValue is string => Boolean(sensitiveValue))
@@ -589,6 +591,7 @@ export class LLMClient {
     );
   }
 
+  /** Normalize an unknown error to a message, then redact configured Access credentials from it. */
   private safeErrorMessage(error: unknown): string {
     const message = errorMessage(error);
     return redactAccessValues(message, this.cloudflareAccessSensitiveValues);

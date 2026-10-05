@@ -1060,6 +1060,7 @@ class ToolsUnsupportedError extends Error {
     }
 }
 exports.ToolsUnsupportedError = ToolsUnsupportedError;
+/** Recognize localhost, IPv4 127/8, and IPv6 ::1 literals as local-only hosts. */
 function isLoopbackHostname(hostname) {
     const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
     if (host === "localhost")
@@ -1067,6 +1068,7 @@ function isLoopbackHostname(hostname) {
     const ipVersion = (0, node_net_1.isIP)(host);
     return (ipVersion === 4 && host.startsWith("127.")) || (ipVersion === 6 && host === "::1");
 }
+/** Redact longer configured credentials before shorter contained values can obscure a full match. */
 function redactAccessValues(value, sensitiveValues) {
     const values = (Array.isArray(sensitiveValues) ? sensitiveValues : [sensitiveValues])
         .filter((sensitiveValue) => Boolean(sensitiveValue))
@@ -1477,6 +1479,7 @@ class LLMClient {
         }
         throw new Error(`Empty response from LLM after ${this.maxAttempts} attempts (finish_reason=${lastFinishReason})`);
     }
+    /** Normalize an unknown error to a message, then redact configured Access credentials from it. */
     safeErrorMessage(error) {
         const message = (0, llm_retry_1.errorMessage)(error);
         return redactAccessValues(message, this.cloudflareAccessSensitiveValues);
