@@ -1053,6 +1053,7 @@ const llm_provider_1 = __nccwpck_require__(710);
 const core = __importStar(__nccwpck_require__(7484));
 /** The provider or model cannot take `tools`; callers should fall back to a plain completion. */
 class ToolsUnsupportedError extends Error {
+    /** Wrap a provider's unsupported-tools failure after redacting configured Access credentials. */
     constructor(cause, sensitiveValues) {
         const message = redactAccessValues((0, llm_retry_1.errorMessage)(cause), sensitiveValues);
         super(`Model does not support tool calling: ${message}`);
@@ -1436,6 +1437,10 @@ class LLMClient {
             toolChoice: options.toolChoice,
         });
     }
+    /**
+     * Run a completion with bounded retries and request-shape fallbacks; sanitize terminal
+     * provider errors before logging or exposing them to callers.
+     */
     async complete(messages, options) {
         let lastFinishReason = "unknown";
         let lastError;
@@ -1547,7 +1552,11 @@ class LLMClient {
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
         };
     }
-    /** Stream so the first SSE chunk (model id) proves OpenRouter routed; abort if none arrives. */
+    /**
+     * Consume an OpenRouter SSE response incrementally, then sanitize assembled content,
+     * tool-call fields, and model metadata before returning them. A first-chunk deadline
+     * covers connection setup and delivery; abort if no chunk arrives in time.
+     */
     async streamChatCompletion(request) {
         const firstChunkMs = config_1.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS;
         const controller = new AbortController();
@@ -2218,6 +2227,11 @@ const repo_config_1 = __nccwpck_require__(2800);
 const review_prompts_1 = __nccwpck_require__(319);
 const commands_1 = __nccwpck_require__(367);
 const trigger_1 = __nccwpck_require__(9717);
+/**
+ * Orchestrate eligible GitHub review events and status reporting. Mask configured
+ * Cloudflare credentials before passing them to the LLM client; skip unsupported or
+ * unauthorized triggers without starting a review.
+ */
 async function run() {
     let octokit;
     let statusOwner = "";

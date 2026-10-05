@@ -55,6 +55,7 @@ export interface ToolChatOptions {
 
 /** The provider or model cannot take `tools`; callers should fall back to a plain completion. */
 export class ToolsUnsupportedError extends Error {
+  /** Wrap a provider's unsupported-tools failure after redacting configured Access credentials. */
   constructor(cause: unknown, sensitiveValues?: string | string[]) {
     const message = redactAccessValues(errorMessage(cause), sensitiveValues);
     super(`Model does not support tool calling: ${message}`);
@@ -527,6 +528,10 @@ export class LLMClient {
     });
   }
 
+  /**
+   * Run a completion with bounded retries and request-shape fallbacks; sanitize terminal
+   * provider errors before logging or exposing them to callers.
+   */
   private async complete(
     messages: ChatMessage[],
     options: CompletionOptions
@@ -670,7 +675,11 @@ export class LLMClient {
     };
   }
 
-  /** Stream so the first SSE chunk (model id) proves OpenRouter routed; abort if none arrives. */
+  /**
+   * Consume an OpenRouter SSE response incrementally, then sanitize assembled content,
+   * tool-call fields, and model metadata before returning them. A first-chunk deadline
+   * covers connection setup and delivery; abort if no chunk arrives in time.
+   */
   private async streamChatCompletion(request: ChatRequest): Promise<ChatCompletionResult> {
     const firstChunkMs = DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS;
     const controller = new AbortController();

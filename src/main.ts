@@ -41,6 +41,11 @@ import { getReviewPrompt, getSummaryPrompt, getHelpMessage } from "./prompts/rev
 import { ReviewerCommand, hasRequiredPermission, parseSlashCommand } from "./commands";
 import { shouldSkipSynchronizeEvent } from "./trigger";
 
+/**
+ * Orchestrate eligible GitHub review events and status reporting. Mask configured
+ * Cloudflare credentials before passing them to the LLM client; skip unsupported or
+ * unauthorized triggers without starting a review.
+ */
 async function run(): Promise<void> {
   let octokit: ReturnType<typeof github.getOctokit> | undefined;
   let statusOwner = "";
