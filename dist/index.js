@@ -1073,6 +1073,11 @@ function redactAccessValues(value, sensitiveValues) {
         .sort((left, right) => right.length - left.length);
     return values.reduce((redacted, sensitiveValue) => redacted.split(sensitiveValue).join("[REDACTED]"), value);
 }
+/**
+ * Recursively redact configured credentials from strings in a JSON-like value,
+ * including object keys. Non-string primitives pass through unchanged; if
+ * redaction makes object keys collide, the later entry wins.
+ */
 function redactAccessValue(value, sensitiveValues) {
     if (typeof value === "string")
         return redactAccessValues(value, sensitiveValues);
@@ -1087,14 +1092,49 @@ function redactAccessValue(value, sensitiveValues) {
     }
     return value;
 }
-/** Scrub echoed credentials incrementally, retaining only a possible cross-chunk token prefix. */
+/**
+ * Redact complete credentials and retain possible cross-chunk starts without emitting
+ * any characters covered by a match. Retained match metadata preserves overlaps such
+ * as `abab` followed by `ab` when the configured credential is `abab`.
+ */
 function redactAccessSecretStream(stream, sensitiveValues) {
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let carry = "";
+    let hiddenCarry = [];
+    const redactPrefix = (value, hidden, length) => {
+        let output = "";
+        let inHiddenRun = false;
+        for (let index = 0; index < length; index += 1) {
+            if (hidden[index]) {
+                if (!inHiddenRun)
+                    output += "[REDACTED]";
+                inHiddenRun = true;
+            }
+            else {
+                output += value[index];
+                inHiddenRun = false;
+            }
+        }
+        return output;
+    };
     return stream.pipeThrough(new TransformStream({
         transform(chunk, controller) {
-            const combined = carry + decoder.decode(chunk, { stream: true });
+            const incoming = decoder.decode(chunk, { stream: true });
+            const combined = carry + incoming;
+            const hidden = hiddenCarry.concat(Array.from({ length: incoming.length }, () => false));
+            // Mark every complete occurrence before choosing a safe output boundary. Marking
+            // all spans (rather than consuming the first match) protects self-overlapping and
+            // overlapping credentials while still allowing the unmatched suffix to stream.
+            for (const sensitiveValue of sensitiveValues) {
+                for (let start = 0; start <= combined.length - sensitiveValue.length; start += 1) {
+                    if (combined.startsWith(sensitiveValue, start)) {
+                        for (let index = start; index < start + sensitiveValue.length; index += 1) {
+                            hidden[index] = true;
+                        }
+                    }
+                }
+            }
             let possibleSecretPrefixLength = 0;
             for (const sensitiveValue of sensitiveValues) {
                 const maxPrefixLength = Math.min(sensitiveValue.length - 1, combined.length);
@@ -1106,13 +1146,26 @@ function redactAccessSecretStream(stream, sensitiveValues) {
                 }
             }
             const boundary = combined.length - possibleSecretPrefixLength;
-            const ready = redactAccessValues(combined.slice(0, boundary), sensitiveValues);
+            const ready = redactPrefix(combined, hidden, boundary);
             if (ready)
                 controller.enqueue(encoder.encode(ready));
             carry = combined.slice(boundary);
+            hiddenCarry = hidden.slice(boundary);
         },
         flush(controller) {
-            const finalText = redactAccessValues(carry + decoder.decode(), sensitiveValues);
+            const incoming = decoder.decode();
+            const combined = carry + incoming;
+            const hidden = hiddenCarry.concat(Array.from({ length: incoming.length }, () => false));
+            for (const sensitiveValue of sensitiveValues) {
+                for (let start = 0; start <= combined.length - sensitiveValue.length; start += 1) {
+                    if (combined.startsWith(sensitiveValue, start)) {
+                        for (let index = start; index < start + sensitiveValue.length; index += 1) {
+                            hidden[index] = true;
+                        }
+                    }
+                }
+            }
+            const finalText = redactPrefix(combined, hidden, combined.length);
             if (finalText)
                 controller.enqueue(encoder.encode(finalText));
         },
@@ -1162,6 +1215,14 @@ function redactAccessSecretResponse(response, sensitiveValues) {
         },
     });
 }
+/**
+ * Create an OpenAI-compatible fetch that adds Cloudflare Access service-token
+ * headers and redacts those credentials from response headers and bodies before
+ * returning them. Redirects are rejected so the credentials cannot reach another origin.
+ *
+ * @param clientId Cloudflare Access service-token client ID.
+ * @param clientSecret Cloudflare Access service-token client secret.
+ */
 function makeCloudflareAccessFetch(clientId, clientSecret) {
     const accessFetch = (url, init) => {
         const requestInit = init;
@@ -1194,6 +1255,23 @@ class LLMClient {
     responseFormat = "json_schema";
     tokenLimitParam = "max_tokens";
     droppedParams = [];
+    /**
+     * Create an LLM client with optional Cloudflare Access service-token authentication.
+     * Configure both Access credentials together. When provided, the LLM base URL must
+     * use HTTPS, except that HTTP loopback URLs are allowed for local testing.
+     *
+     * @param baseUrl OpenAI-compatible LLM endpoint.
+     * @param apiKey Provider API key.
+     * @param model Model identifier.
+     * @param maxOutputTokens Optional output-token limit.
+     * @param timeoutMs Request timeout in milliseconds.
+     * @param maxAttempts Maximum completion attempts.
+     * @param temperature Sampling temperature.
+     * @param onProgress Optional callback for progress updates.
+     * @param reasoningEffort Optional reasoning-effort setting.
+     * @param cfAccessClientId Optional Cloudflare Access service-token client ID.
+     * @param cfAccessClientSecret Optional Cloudflare Access service-token client secret.
+     */
     constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort, cfAccessClientId, cfAccessClientSecret) {
         this.model = model;
         this.temperature = temperature;
@@ -1403,6 +1481,10 @@ class LLMClient {
         const message = (0, llm_retry_1.errorMessage)(error);
         return redactAccessValues(message, this.cloudflareAccessSensitiveValues);
     }
+    /** Redact configured Access credentials from provider-returned values before exposing them to callers. */
+    safeProviderValue(value) {
+        return redactAccessValues(value, this.cloudflareAccessSensitiveValues);
+    }
     /**
      * One completion request. If the provider rejects an optional part of the request —
      * the reasoning control (unsupported or invalid value) or a parameter such as
@@ -1488,8 +1570,9 @@ class LLMClient {
                     clearStallTimer();
                     resolvedModel = chunk.model || resolvedModel;
                     if (chunk.model && chunk.model !== this.model) {
-                        core.info(`LLM resolved model: ${chunk.model} (requested: ${this.model})`);
-                        await this.progress(`Routed to \`${chunk.model}\` — generating review…`);
+                        const safeModel = this.safeProviderValue(chunk.model);
+                        core.info(`LLM resolved model: ${safeModel} (requested: ${this.safeProviderValue(this.model)})`);
+                        await this.progress(`Routed to \`${safeModel}\` — generating review…`);
                     }
                     else {
                         core.info("OpenRouter stream started — provider accepted the request.");
@@ -1518,10 +1601,15 @@ class LLMClient {
             const toolCalls = [...toolCallParts.entries()]
                 .sort(([a], [b]) => a - b)
                 .map(([index, call]) => ({ ...call, id: call.id || `call_${index}` }))
-                .filter((call) => call.name);
+                .filter((call) => call.name)
+                .map((call) => ({
+                id: this.safeProviderValue(call.id),
+                name: this.safeProviderValue(call.name),
+                arguments: this.safeProviderValue(call.arguments),
+            }));
             return {
-                content: parts.join(""),
-                model: resolvedModel,
+                content: this.safeProviderValue(parts.join("")),
+                model: this.safeProviderValue(resolvedModel),
                 ...(toolCalls.length > 0 ? { toolCalls } : {}),
             };
         }

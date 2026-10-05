@@ -359,6 +359,57 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
     }
   });
 
+  it("redacts a self-overlapping credential when a network chunk ends after its full value", async () => {
+    const clientId = "abab";
+    const secret = "ababa";
+    const server = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // The boundary is exactly after a full credential. Its final `ab` is also a
+      // possible beginning of another occurrence, so the scanner must retain it hidden.
+      res.write(`data: {"broken":"${clientId}`);
+      setTimeout(() => res.end('a"x"}\n\n'), 10);
+    });
+    const address = await listen(server);
+    const originalDebug = process.env.DEBUG;
+    process.env.DEBUG = "true";
+    const debugLog = jest.spyOn(console, "log").mockImplementation(() => {});
+    const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const client = new LLMClient(
+        `http://127.0.0.1:${address.port}/v1`,
+        "test-key",
+        "openrouter/free",
+        undefined,
+        5000,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        clientId,
+        secret
+      );
+      const error = await client.chatCompletion("system", "user").then(
+        () => { throw new Error("Expected the malformed SSE event to fail"); },
+        (reason: unknown) => reason as Error
+      );
+      const logs = `${debugOutput(debugLog)}\n${debugOutput(errorLog)}`;
+
+      expect(error.message).not.toContain(clientId);
+      expect(error.message).not.toContain(secret);
+      expect(logs).toContain("[REDACTED]");
+      expect(logs).not.toContain(clientId);
+      expect(logs).not.toContain(secret);
+    } finally {
+      debugLog.mockRestore();
+      errorLog.mockRestore();
+      if (originalDebug === undefined) delete process.env.DEBUG;
+      else process.env.DEBUG = originalDebug;
+      await close(server);
+    }
+  });
+
   it("redacts an echoed Cloudflare Access secret from LLM errors and logs", async () => {
     const clientId = "cf-client-id";
     const secret = "cf-client-secret";

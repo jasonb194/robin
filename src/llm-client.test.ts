@@ -1054,6 +1054,53 @@ describe("LLMClient tool calling", () => {
     ]);
   });
 
+  it("redacts credentials assembled across valid content deltas", async () => {
+    const clientId = "client-credential";
+    const clientSecret = "proxy-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "openrouter/free", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce(streamOf([
+      { model: "vendor/model", choices: [{ delta: { content: `leak: ${clientId.slice(0, 8)}` } }] },
+      { model: "vendor/model", choices: [{ delta: { content: `${clientId.slice(8)} and ${clientSecret}` } }] },
+    ]));
+
+    const result = await client.chatCompletion("system", "user");
+
+    expect(result.content).toBe("leak: [REDACTED] and [REDACTED]");
+    expect(result.model).toBe("vendor/model");
+  });
+
+  it("redacts credentials assembled across streamed tool-call fields", async () => {
+    const clientId = "client-credential";
+    const clientSecret = "proxy-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "openrouter/free", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce(streamOf([
+      {
+        model: "vendor/model",
+        choices: [{ delta: { tool_calls: [{ index: 0, id: clientId, function: { name: clientSecret.slice(0, 5), arguments: `{"value":"${clientId.slice(0, 7)}` } }] } }],
+      },
+      {
+        model: "vendor/model",
+        choices: [{ delta: { tool_calls: [{ index: 0, function: { name: clientSecret.slice(5), arguments: `${clientId.slice(7)} ${clientSecret}"}` } }] } }],
+      },
+    ]));
+
+    const result = await client.chatWithTools(messages, tools);
+
+    expect(result.toolCalls).toEqual([{
+      id: "[REDACTED]",
+      name: "[REDACTED]",
+      arguments: '{"value":"[REDACTED] [REDACTED]"}',
+    }]);
+  });
+
   it("throws ToolsUnsupportedError without retrying when a router has no tool-capable endpoint", async () => {
     const client = new LLMClient("https://openrouter.ai/api/v1", "k", "openrouter/free");
     const create = stubOpenAI(client);
