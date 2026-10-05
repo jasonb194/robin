@@ -158,6 +158,22 @@ describe("LLMClient provider-aware request shape", () => {
     ).not.toThrow();
   });
 
+  it("redacts both Cloudflare Access values in safe error messages", () => {
+    const clientId = "cf-client-id";
+    const clientSecret = "cf-client-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "model", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const safeErrorMessage = (client as unknown as {
+      safeErrorMessage(error: unknown): string;
+    }).safeErrorMessage(new Error(`Proxy rejected ${clientId}; secret was ${clientSecret}`));
+
+    expect(safeErrorMessage).toBe("Proxy rejected [REDACTED]; secret was [REDACTED]");
+    expect(safeErrorMessage).not.toContain(clientId);
+    expect(safeErrorMessage).not.toContain(clientSecret);
+  });
+
   it("sends OpenAI-native reasoning_effort to api.openai.com", () => {
     const client = makeClient("https://api.openai.com/v1", "gpt-4o", { effort: "high" });
     const request = buildRequest(client);
@@ -1049,6 +1065,31 @@ describe("LLMClient tool calling", () => {
 
     await expect(client.chatWithTools(messages, tools)).rejects.toBeInstanceOf(ToolsUnsupportedError);
     expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("redacts both Cloudflare Access values from ToolsUnsupportedError", async () => {
+    const clientId = "cf-client-id";
+    const clientSecret = "cf-client-secret";
+    const client = new LLMClient(
+      "https://proxy.example.test/v1", "k", "model", undefined, undefined, 1,
+      undefined, undefined, undefined, clientId, clientSecret
+    );
+    const create = stubOpenAI(client);
+    create.mockRejectedValue(
+      Object.assign(new Error(`No endpoints found that support tool use: ${clientId} ${clientSecret}`), {
+        status: 404,
+      })
+    );
+
+    const error = await client.chatWithTools(messages, tools).then(
+      () => { throw new Error("Expected the unsupported-tools request to fail"); },
+      (reason: unknown) => reason as Error
+    );
+
+    expect(error).toBeInstanceOf(ToolsUnsupportedError);
+    expect(error.message).toContain("[REDACTED]");
+    expect(error.message).not.toContain(clientId);
+    expect(error.message).not.toContain(clientSecret);
   });
 
   it("keeps normal router 404 retries for plain completions", async () => {

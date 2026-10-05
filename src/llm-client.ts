@@ -55,11 +55,9 @@ export interface ToolChatOptions {
 
 /** The provider or model cannot take `tools`; callers should fall back to a plain completion. */
 export class ToolsUnsupportedError extends Error {
-  constructor(cause: unknown, sensitiveValue?: string) {
-    const message = errorMessage(cause);
-    super(
-      `Model does not support tool calling: ${sensitiveValue ? message.split(sensitiveValue).join("[REDACTED]") : message}`
-    );
+  constructor(cause: unknown, sensitiveValues?: string | string[]) {
+    const message = redactAccessValues(errorMessage(cause), sensitiveValues);
+    super(`Model does not support tool calling: ${message}`);
     this.name = "ToolsUnsupportedError";
   }
 }
@@ -79,19 +77,22 @@ function isLoopbackHostname(hostname: string): boolean {
   return (ipVersion === 4 && host.startsWith("127.")) || (ipVersion === 6 && host === "::1");
 }
 
-function redactAccessSecret(value: string, secret: string): string {
-  return value.split(secret).join("[REDACTED]");
+function redactAccessValues(value: string, sensitiveValues?: string | string[]): string {
+  const values = (Array.isArray(sensitiveValues) ? sensitiveValues : [sensitiveValues])
+    .filter((sensitiveValue): sensitiveValue is string => Boolean(sensitiveValue))
+    .sort((left, right) => right.length - left.length);
+  return values.reduce((redacted, sensitiveValue) => redacted.split(sensitiveValue).join("[REDACTED]"), value);
 }
 
-function redactAccessSecretValue(value: unknown, secret: string): unknown {
-  if (typeof value === "string") return redactAccessSecret(value, secret);
-  if (Array.isArray(value)) return value.map((item) => redactAccessSecretValue(item, secret));
+function redactAccessValue(value: unknown, sensitiveValues: string[]): unknown {
+  if (typeof value === "string") return redactAccessValues(value, sensitiveValues);
+  if (Array.isArray(value)) return value.map((item) => redactAccessValue(item, sensitiveValues));
   if (typeof value === "object" && value !== null) {
     // Keep response order; if redaction maps two keys to the same key, the later entry wins.
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
-        redactAccessSecret(key, secret),
-        redactAccessSecretValue(item, secret),
+        redactAccessValues(key, sensitiveValues),
+        redactAccessValue(item, sensitiveValues),
       ])
     );
   }
@@ -101,7 +102,7 @@ function redactAccessSecretValue(value: unknown, secret: string): unknown {
 /** Scrub echoed credentials incrementally, retaining only a possible cross-chunk token prefix. */
 function redactAccessSecretStream(
   stream: ReadableStream<Uint8Array>,
-  secret: string
+  sensitiveValues: string[]
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -112,20 +113,22 @@ function redactAccessSecretStream(
       transform(chunk, controller) {
         const combined = carry + decoder.decode(chunk, { stream: true });
         let possibleSecretPrefixLength = 0;
-        const maxPrefixLength = Math.min(secret.length - 1, combined.length);
-        for (let length = maxPrefixLength; length > 0; length -= 1) {
-          if (secret.startsWith(combined.slice(-length))) {
-            possibleSecretPrefixLength = length;
-            break;
+        for (const sensitiveValue of sensitiveValues) {
+          const maxPrefixLength = Math.min(sensitiveValue.length - 1, combined.length);
+          for (let length = maxPrefixLength; length > possibleSecretPrefixLength; length -= 1) {
+            if (sensitiveValue.startsWith(combined.slice(-length))) {
+              possibleSecretPrefixLength = length;
+              break;
+            }
           }
         }
         const boundary = combined.length - possibleSecretPrefixLength;
-        const ready = redactAccessSecret(combined.slice(0, boundary), secret);
+        const ready = redactAccessValues(combined.slice(0, boundary), sensitiveValues);
         if (ready) controller.enqueue(encoder.encode(ready));
         carry = combined.slice(boundary);
       },
       flush(controller) {
-        const finalText = redactAccessSecret(carry + decoder.decode(), secret);
+        const finalText = redactAccessValues(carry + decoder.decode(), sensitiveValues);
         if (finalText) controller.enqueue(encoder.encode(finalText));
       },
     })
@@ -133,7 +136,7 @@ function redactAccessSecretStream(
 }
 
 /** Redact debug-visible response headers and bodies while leaving SSE delivery incremental. */
-function redactAccessSecretResponse(response: Response, secret: string): Response {
+function redactAccessSecretResponse(response: Response, sensitiveValues: string[]): Response {
   const responseHeaders = new Headers(response.headers);
   const headers = new Headers();
   let redactedHeaderIndex = 0;
@@ -141,12 +144,12 @@ function redactAccessSecretResponse(response: Response, secret: string): Respons
     // Header names are case-insensitive and constrained to token characters, so use a
     // valid replacement name instead of inserting the `[REDACTED]` marker.
     let sanitizedName = name;
-    if (name.toLowerCase().includes(secret.toLowerCase())) {
+    if (sensitiveValues.some((sensitiveValue) => name.toLowerCase().includes(sensitiveValue.toLowerCase()))) {
       do {
         sanitizedName = `x-robin-redacted-header-${redactedHeaderIndex++}`;
       } while (responseHeaders.has(sanitizedName) || headers.has(sanitizedName));
     }
-    headers.append(sanitizedName, redactAccessSecret(value, secret));
+    headers.append(sanitizedName, redactAccessValues(value, sensitiveValues));
   });
 
   let redactedBody: ReadableStream<Uint8Array> | null;
@@ -157,19 +160,19 @@ function redactAccessSecretResponse(response: Response, secret: string): Respons
       if (property === "body") {
         if (!bodyInitialized) {
           const body = target.body;
-          redactedBody = body ? redactAccessSecretStream(body, secret) : null;
+          redactedBody = body ? redactAccessSecretStream(body, sensitiveValues) : null;
           bodyInitialized = true;
         }
         return redactedBody;
       }
       if (property === "json") {
-        return async () => redactAccessSecretValue(await target.json(), secret);
+        return async () => redactAccessValue(await target.json(), sensitiveValues);
       }
       if (property === "text") {
-        return async () => redactAccessSecret(await target.text(), secret);
+        return async () => redactAccessValues(await target.text(), sensitiveValues);
       }
       if (property === "clone") {
-        return () => redactAccessSecretResponse(target.clone(), secret);
+        return () => redactAccessSecretResponse(target.clone(), sensitiveValues);
       }
 
       const value = Reflect.get(target, property, target);
@@ -191,7 +194,7 @@ function makeCloudflareAccessFetch(
     // OpenAI's default fetch follows cross-origin redirects without stripping custom
     // headers. A configured Access token must only reach the configured LLM endpoint.
     return fetch(String(url), { ...requestInit, headers, redirect: "error" })
-      .then((response) => redactAccessSecretResponse(response, clientSecret)) as unknown as ReturnType<
+      .then((response) => redactAccessSecretResponse(response, [clientId, clientSecret])) as unknown as ReturnType<
         NonNullable<ClientOptions["fetch"]>
       >;
   };
@@ -220,7 +223,7 @@ export class LLMClient {
   private temperature: number;
   private onProgress?: LlmProgressHandler;
   private reasoningEffort?: string;
-  private cloudflareAccessClientSecret?: string;
+  private cloudflareAccessSensitiveValues?: string[];
   private reasoningFallbackActive = false;
   private reasoningFallbackReason?: ReasoningFallbackReason;
   /** Request-shape compatibility state; adjusted once per rejected parameter and kept for the run. */
@@ -281,7 +284,7 @@ export class LLMClient {
           "Cloudflare Access service tokens require an https:// LLM base URL; http://localhost and loopback addresses are allowed for local testing."
         );
       }
-      this.cloudflareAccessClientSecret = accessClientSecret;
+      this.cloudflareAccessSensitiveValues = [accessClientId, accessClientSecret];
     }
     if (normalizedBaseUrl !== baseUrl.trim()) {
       core.info(`Normalized LLM base URL: ${baseUrl} -> ${normalizedBaseUrl}`);
@@ -474,7 +477,7 @@ export class LLMClient {
       } catch (error) {
         lastError = error;
         if (options.tools && isToolsUnsupportedError(error)) {
-          throw new ToolsUnsupportedError(error, this.cloudflareAccessClientSecret);
+          throw new ToolsUnsupportedError(error, this.cloudflareAccessSensitiveValues);
         }
         core.warning(`LLM attempt ${attempt}/${this.maxAttempts} failed: ${this.safeErrorMessage(error)}`);
 
@@ -509,9 +512,7 @@ export class LLMClient {
 
   private safeErrorMessage(error: unknown): string {
     const message = errorMessage(error);
-    return this.cloudflareAccessClientSecret
-      ? redactAccessSecret(message, this.cloudflareAccessClientSecret)
-      : message;
+    return redactAccessValues(message, this.cloudflareAccessSensitiveValues);
   }
 
   /**

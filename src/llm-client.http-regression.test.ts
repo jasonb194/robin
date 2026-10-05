@@ -296,7 +296,8 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
     }
   }, 15000);
 
-  it("redacts an echoed secret split across malformed SSE chunks before SDK error logs", async () => {
+  it("redacts an echoed client ID split across malformed SSE chunks before SDK error logs", async () => {
+    const clientId = "cf-client-id";
     const secret = "cf-client-secret";
     const requestHeaders: Record<string, string | string[] | undefined>[] = [];
     const server = http.createServer((req, res) => {
@@ -304,11 +305,11 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
       req.resume();
       res.writeHead(200, {
         "content-type": "text/event-stream",
-        "x-echoed-access-token": secret,
+        "x-echoed-access-token": `${clientId} ${secret}`,
       });
       const splitAt = 7;
-      res.write(`data: Access token rejected: ${secret.slice(0, splitAt)}`);
-      setTimeout(() => res.end(`${secret.slice(splitAt)}\n\n`), 10);
+      res.write(`data: Access token rejected: ${clientId.slice(0, splitAt)}`);
+      setTimeout(() => res.end(`${clientId.slice(splitAt)} ${secret}\n\n`), 10);
     });
     const address = await listen(server);
     const originalDebug = process.env.DEBUG;
@@ -327,7 +328,7 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
         undefined,
         undefined,
         undefined,
-        "cf-client-id",
+        clientId,
         secret
       );
       const error = await client.chatCompletion("system", "user").then(
@@ -340,12 +341,15 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
       const parserErrors = debugOutput(errorLog);
 
       expect(error.message).not.toContain(secret);
+      expect(error.message).not.toContain(clientId);
       expect(requestHeaders).toHaveLength(1);
       expect(requestHeaders[0]["cf-access-client-secret"]).toBe(secret);
       expect(debugLogs).toContain("[REDACTED]");
       expect(debugLogs).not.toContain(secret);
+      expect(debugLogs).not.toContain(clientId);
       expect(parserErrors).toContain("[REDACTED]");
       expect(parserErrors).not.toContain(secret);
+      expect(parserErrors).not.toContain(clientId);
     } finally {
       debugLog.mockRestore();
       errorLog.mockRestore();
@@ -356,10 +360,11 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
   });
 
   it("redacts an echoed Cloudflare Access secret from LLM errors and logs", async () => {
+    const clientId = "cf-client-id";
     const secret = "cf-client-secret";
     const gateway = await startGateway(() => ({
       status: 401,
-      body: { error: { message: `Access token rejected: ${secret}` } },
+      body: { error: { message: `Access token rejected: ${clientId} ${secret}` } },
     }));
     try {
       jest.clearAllMocks();
@@ -373,7 +378,7 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
         undefined,
         undefined,
         undefined,
-        "cf-client-id",
+        clientId,
         secret
       );
       const error = await client.chatCompletion("system", "user").then(
@@ -385,27 +390,35 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
 
       expect(error.message).toContain("[REDACTED]");
       expect(error.message).not.toContain(secret);
+      expect(error.message).not.toContain(clientId);
       const logs = [
         ...(core.warning as jest.Mock).mock.calls,
         ...(core.error as jest.Mock).mock.calls,
       ].flat().join(" ");
       expect(logs).not.toContain(secret);
+      expect(logs).not.toContain(clientId);
     } finally {
       await gateway.close();
     }
   });
 
   it("redacts echoed secrets from SDK debug response values, keys, and headers", async () => {
+    const clientId = "cf-client-id";
     const secret = "cf-client-secret";
-    const response = completion("test-model", `Provider echoed ${secret}`);
+    const response = completion("test-model", `Provider echoed ${clientId} ${secret}`);
     const responseBody = response.body as unknown as {
       choices: Array<{ message: Record<string, unknown> }>;
     };
+    responseBody.choices[0].message[clientId] = "echoed client ID property";
     responseBody.choices[0].message[secret] = "earlier colliding property";
     responseBody.choices[0].message["[REDACTED]"] = "later colliding property";
     const gateway = await startGateway(() => ({
       ...response,
-      headers: { "x-echoed-access-token": secret, [secret]: "echoed in header name" },
+      headers: {
+        "x-echoed-access-token": `${clientId} ${secret}`,
+        [secret]: "echoed in header name",
+        [clientId]: "echoed client ID header name",
+      },
     }));
     const originalDebug = process.env.DEBUG;
     process.env.DEBUG = "true";
@@ -428,13 +441,14 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
       const result = await client.chatCompletion("system", "user");
       const logs = debugOutput(debugLog);
 
-      expect(result.content).toBe("Provider echoed [REDACTED]");
+      expect(result.content).toBe("Provider echoed [REDACTED] [REDACTED]");
       expect(logs).toContain("x-echoed-access-token");
       expect(logs).toContain("x-robin-redacted-header-0");
       expect(logs).toContain("[REDACTED]");
       expect(logs).toContain("later colliding property");
       expect(logs).not.toContain("earlier colliding property");
       expect(logs).not.toContain(secret);
+      expect(logs).not.toContain(clientId);
     } finally {
       debugLog.mockRestore();
       if (originalDebug === undefined) delete process.env.DEBUG;
@@ -444,11 +458,12 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
   });
 
   it("redacts echoed secrets from SDK debug output for non-JSON error bodies", async () => {
+    const clientId = "cf-client-id";
     const secret = "cf-client-secret";
     const gateway = await startGateway(() => ({
       status: 401,
-      body: `Access token rejected: ${secret}`,
-      headers: { "x-echoed-access-token": secret },
+      body: `Access token rejected: ${clientId} ${secret}`,
+      headers: { "x-echoed-access-token": `${clientId} ${secret}` },
     }));
     const originalDebug = process.env.DEBUG;
     process.env.DEBUG = "true";
@@ -465,7 +480,7 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
         undefined,
         undefined,
         undefined,
-        "cf-client-id",
+        clientId,
         secret
       );
       const error = await client.chatCompletion("system", "user").then(
@@ -478,8 +493,10 @@ describe("max-output-tokens compatibility (real local endpoint)", () => {
 
       expect(error.message).toContain("[REDACTED]");
       expect(error.message).not.toContain(secret);
+      expect(error.message).not.toContain(clientId);
       expect(logs).toContain("[REDACTED]");
       expect(logs).not.toContain(secret);
+      expect(logs).not.toContain(clientId);
     } finally {
       debugLog.mockRestore();
       if (originalDebug === undefined) delete process.env.DEBUG;
