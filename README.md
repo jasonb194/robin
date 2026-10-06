@@ -76,6 +76,76 @@ Prefer to do it by hand, or read the installer first? It's
 [bin/robin-review.js](bin/robin-review.js) (npm) / [scripts/install.sh](scripts/install.sh)
 (curl) — or follow the manual 3 steps instead.
 
+### Install across an account
+
+To bootstrap several repositories in one run, use the npm installer with GitHub CLI
+(`gh`) authenticated to an account that can access the target repositories:
+
+```bash
+npx robin-review --org YOUR_ORG --mode all
+# Or, for your own user account (the login must match `gh auth status`):
+npx robin-review --user YOUR_GITHUB_LOGIN --mode all
+```
+
+The installer lists repositories currently accessible in that organization or owned by
+that user, previews the selected repositories, and asks before making changes. It adds
+`.github/workflows/robin.yml` to active repositories that do not already have a file at
+that path. Archived repositories and repositories without a default branch are skipped;
+an existing workflow at that path is preserved. Use `--dry-run` to preview without
+changes, or `--yes` to skip the final confirmation.
+
+Choose which repositories to include with `--mode all`, `--mode none`, `--mode all-but`,
+or `--mode only`. `all-but` and `only` take one or more `--select` values. Names match
+repository names case-insensitively; `regex:` selectors use RE2 syntax and match part of
+the repository name:
+
+```bash
+# Review every eligible repository
+npx robin-review --org YOUR_ORG --mode all
+
+# Review none (no repositories are changed)
+npx robin-review --org YOUR_ORG --mode none
+
+# Review all except these repositories
+npx robin-review --org YOUR_ORG --mode all-but \
+  --select name:website --select regex:^archive-
+
+# Review only matching repositories
+npx robin-review --org YOUR_ORG --mode only \
+  --select name:api --select regex:^service-
+```
+
+If you omit `--mode` in an interactive terminal, the installer asks which policy to use.
+In non-interactive runs, pass `--mode`; `all-but` and `only` also require explicit
+`--select` values.
+
+The installer can add missing Actions secrets after workflow setup. For an organization,
+it adds each missing organization secret once and scopes it to repositories where Robin's
+workflow is current or was installed successfully. For a user account, it adds missing
+repository secrets separately in each such repository. It checks secret names immediately
+before setup and skips names already present. GitHub secret writes replace a value by
+name, so a concurrent admin change between that check and the write can still race;
+coordinate simultaneous secret setup. You can enter missing LLM values at the hidden
+prompts or provide them through environment variables. Optional Cloudflare Access
+credentials are read from environment variables; provide both values if both secrets
+are missing. Use `--skip-secrets` to leave secrets unchanged; add them later in GitHub
+Settings.
+
+For a non-interactive run, provide environment values for any missing secrets and `--yes`,
+or use `--skip-secrets`:
+
+```bash
+LLM_API_KEY='…' LLM_BASE_URL='https://openrouter.ai/api/v1' LLM_MODEL='openrouter/free' \
+  npx robin-review --org YOUR_ORG --mode all --yes
+```
+
+The GitHub CLI needs permission to list and update the selected repositories. Adding
+organization Actions secrets also requires permission to manage organization Actions
+secrets. See [account bootstrap details](docs/ADVANCED.md#account-level-bootstrap) for
+the full behavior and limitations. This is a one-time bulk bootstrap: repositories created
+later are not enrolled automatically, so rerun the command to include them. For automatic
+enrollment of future repositories, an account-level GitHub App service would be needed.
+
 ## Setup in 3 steps
 
 ### Step 1 — Get an API key (free option)

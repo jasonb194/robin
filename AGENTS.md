@@ -101,6 +101,7 @@ user documentation; `skills/robin/` is the companion chat skill shipped for codi
 | `src/agent-review.ts`, `src/review-tools.ts`, `src/repo-snapshot.ts` | Multi-turn agent review and its read-only tools |
 | `src/prompts/`, `src/review-parser.ts` | Review prompts, JSON schema, response parsing |
 | `action.yml`, `.github/workflows/review.yml` | Action inputs and reusable-workflow schema (forwarded 1:1) |
+| `bin/robin-review.js`, `bin/account-review.js`, `bin/repo-selection.js` | Per-repository installer dispatch, account bootstrap, and repository selection policy |
 | `docs/`, `README.md`, `llms.txt` | User-facing setup, behavior, and troubleshooting |
 
 **Documentation ownership.** This root `AGENTS.md` is the documentation contract for the whole
@@ -126,6 +127,11 @@ Keep action inputs, reusable-workflow `workflow_call` inputs, the `with:` forwar
 `review.yml`, the installer template, and the docs in sync — `src/workflow.test.ts` guards
 that parity. Behavior changes that touch optional request parameters should not silently
 drop a user-configured control; surface the provider error instead.
+
+The npm installer supports both per-repository setup and an account-level bulk bootstrap.
+Keep `bin/account-review.js` behavior and options in sync with the account setup sections
+in `README.md` and `docs/ADVANCED.md`. The bootstrap updates currently accessible
+repositories only; it does not enroll repositories created later.
 
 ## Maintainers: release-notes upkeep (automatic)
 

@@ -6,7 +6,8 @@
     "robin-review": "bin/robin-review.js"
   },
   "files": [
-    "bin/"
+    "bin/",
+    "templates/"
   ],
   "engines": {
     "node": ">=18.17"
@@ -46,6 +47,7 @@
     "@actions/github": "^6.0.0",
     "@octokit/rest": "^20.0.2",
     "openai": "^4.28.4",
+    "re2js": "^2.8.6",
     "undici-v6": "npm:undici@^6.28.1"
   },
   "overrides": {

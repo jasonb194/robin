@@ -2,6 +2,100 @@
 
 This document is for maintainers and power users. For a short setup, see the [README](../README.md).
 
+## Account-level bootstrap
+
+Use `npx robin-review --org <owner>` or `--user <login>` to bootstrap Robin across
+repositories accessible to an organization or owned by a user. This is a bulk installer
+that writes the workflow to each selected repository's default branch. It does not set up
+an ongoing GitHub App or automatically enroll repositories created in the future; rerun
+the command when you want to include those repositories.
+
+The GitHub CLI (`gh`) must be installed and authenticated. The account needs access to
+the selected repositories and permission to write their default branches. For `--user`,
+the target login must match the authenticated `gh` account. Setting organization Actions
+secrets also requires permission to manage those secrets in the organization. Check the
+active login with `gh auth status` and authenticate with `gh auth login` if needed.
+
+### Repository selection
+
+Choose one of four policies with `--mode`:
+
+| Mode | Effect |
+| --- | --- |
+| `all` | Select every repository returned for the target account. |
+| `none` | Make no repository changes. |
+| `all-but` | Select all repositories except those matching any selector. |
+| `only` | Select repositories matching at least one selector. |
+
+Pass repeatable `--select name:<repo>` or `--select regex:<pattern>` options with `all-but`
+and `only`. Name matching is case-insensitive and compares the repository name (not
+`owner/name`). Regex uses RE2 syntax, matches any part of the repository name, and is
+limited to 512 characters. For example:
+
+```bash
+# Include all repositories except exact name `website` and names starting `archive-`
+npx robin-review --org acme --mode all-but \
+  --select name:website --select regex:^archive-
+
+# Include only the `api` repository and names containing `service`
+npx robin-review --org acme --mode only \
+  --select name:api --select regex:service
+```
+
+In an interactive terminal, omit `--mode` to choose a policy at a prompt. If `all-but`
+or `only` has no `--select` arguments, the installer prompts for selectors. In
+non-interactive runs, pass `--mode` and supply selectors explicitly for those two modes.
+`--dry-run` prints the workflow plan without writing workflows or setting secrets. The
+installer previews the changes and asks for confirmation; `--yes` skips the final
+confirmation.
+
+### Workflow changes and exclusions
+
+The installer lists repositories currently accessible from the account, then applies the
+selection policy. It skips archived repositories and repositories without a default
+branch. For each remaining selected repository, it creates
+`.github/workflows/robin.yml` if that path is unused. If the file already contains the
+current generated workflow, it leaves it as-is; any other existing file at that path is
+preserved and reported as skipped. It does not open pull requests for these workflow
+changes. Repository-level errors are reported while setup continues for other repos.
+
+### Actions secrets
+
+Unless `--skip-secrets` is given, the installer offers to add missing secrets after it
+previews the workflow changes. It checks secret names before writing and skips names it
+finds. For an organization,
+each missing secret is added once as an organization Actions secret, scoped to repositories
+with the current workflow or where workflow creation succeeds. For a user target, missing
+secrets are set separately in each such repository because GitHub user-level Actions
+secrets are not available for ordinary repositories. If the secret already exists at the
+relevant scope, it is preserved; an existing organization secret's repository visibility
+is not changed by this command. Check that existing organization secrets are scoped to the
+selected repositories; otherwise those workflows cannot read them. GitHub secret writes
+replace a value by name, so a concurrent admin change between the check and write can
+still race; coordinate simultaneous secret setup.
+
+The required values are `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL`. Optional
+`CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are read from environment variables;
+provide both if both secrets are missing. In an interactive terminal, enter missing LLM
+values at the hidden prompts or answer `n` to leave secrets unchanged. The installer
+checks secret names before requesting any values and
+does not ask for values when every target already has the configured secrets. Secret
+values are passed to GitHub CLI through standard input and are not written to the
+repository or printed in the installer's output. Use `--skip-secrets` to defer setup.
+
+For non-interactive execution, provide environment values for any missing secrets and
+`--yes`, or use `--skip-secrets`:
+
+```bash
+LLM_API_KEY='…' LLM_BASE_URL='https://openrouter.ai/api/v1' LLM_MODEL='openrouter/free' \
+  npx robin-review --org acme --mode all --yes
+
+npx robin-review --org acme --mode all --skip-secrets --yes
+```
+
+Optional Cloudflare credentials are read from environment variables. Existing values
+found during the checks remain unchanged.
+
 ## Repository config file
 
 Copy [`.github/robin.yml.example`](../.github/robin.yml.example) to `.github/robin.yml` on your default branch.
