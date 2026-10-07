@@ -104,6 +104,7 @@ user documentation; `skills/robin/` is the companion chat skill shipped for codi
 | `action.yml`, `.github/workflows/review.yml` | Action inputs and reusable-workflow schema (forwarded 1:1) |
 | `bin/robin-review.js`, `bin/account-review.js`, `bin/repo-selection.js` | Per-repository installer dispatch, account bootstrap, and repository selection policy |
 | `controller/src/` | GitHub App OAuth/setup, webhook handling, account policy, repository reconciliation, credential encryption, and PostgreSQL queue |
+| `controller/src/managed-secret.ts`, `controller/src/reconcile-phases.ts`, `controller/src/workflow-template.ts` | Secret creation/ownership recovery, independently reported repository reconciliation, and managed workflow template loading |
 | `controller/Dockerfile`, `controller/docker-compose.yml`, `controller/.env.example` | Self-hosted controller deployment surfaces; the project does not run a hosted controller |
 | `docs/`, `README.md`, `llms.txt` | User-facing setup, behavior, and troubleshooting |
 

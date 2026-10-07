@@ -99,6 +99,9 @@ workflow.
 
 The self-hosted controller writes a managed workflow and adds repository Actions secrets
 under reserved `ROBIN_ACCOUNT_*` names; existing standard `LLM_*` secrets are preserved.
+If a reserved name exists without a Robin ownership record, setup for that repository stops;
+remove or rename that secret manually before retrying. See the
+[secret ownership and recovery details](docs/ADVANCED.md#workflow-and-secret-behavior).
 It writes directly to each repository's default branch when allowed; if branch protection
 or repository rules block that write, it opens a setup pull request for review. When a
 repository stops matching, it removes only an unchanged workflow it manages and the

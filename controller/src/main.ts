@@ -4,12 +4,14 @@ import { Octokit } from "@octokit/rest";
 import { Pool } from "pg";
 import sodium from "libsodium-wrappers";
 import { readFile } from "node:fs/promises";
-import path from "node:path";
 import { decryptSecret, encryptSecret, encryptionKey, hash, randomToken, verifySignature } from "./crypto.js";
 import { selectRepositories, validatePolicy, type Policy } from "./policy.js";
 import { accountConfirmationProvided, contentHash, installationTokenOptions, managedWorkflowsToCleanup, mayUpdateManagedWorkflow, oauthStateMatches, parseTrustedProxyCidrs, queueableInstallationId, revokeOAuthUserToken, safeWorkflowDiff, secretNamesToDelete, setupOriginAllowed, shouldReconcile, uniqueCookieValue, userCanConfigureInstallation, validLlmBaseUrl, validPublicUrl, verifyInstallationOwnership } from "./github-security.js";
 import { Store, type Installation } from "./store.js";
-import { ACCOUNT_SECRET_NAMES, accountWorkflowTemplate, secretWasCreated, type AccountSecretKey } from "./account-workflow.js";
+import { ACCOUNT_SECRET_NAMES, accountWorkflowTemplate, type AccountSecretKey } from "./account-workflow.js";
+import { createAndTrackSecret, skipExistingSecret } from "./managed-secret.js";
+import { processRepositoriesIndependently, summarizeRepositoryFailures } from "./reconcile-phases.js";
+import { resolveWorkflowTemplatePath } from "./workflow-template.js";
 
 /** Read a required environment value, throwing if it is unset or empty. */
 const required = (name: string) => { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value; };
@@ -227,9 +229,10 @@ const secretNames = Object.entries(ACCOUNT_SECRET_NAMES) as Array<[AccountSecret
  * existing setup branches and PRs must pass ownership and content checks.
  *
  * Record workflow ownership and secrets reported newly created with HTTP 201.
- * Existing secret names are skipped, but discovery and upsert are not atomic.
- * Ownership conflicts and remaining GitHub, database, or encryption errors propagate;
- * completed remote writes and ownership records are not rolled back.
+ * Tracked existing names are skipped; untracked reserved names fail visibly, and
+ * discovery/upsert are not atomic. If ownership recording fails after secret creation,
+ * attempt to remove that secret and report any unresolved remote state. Other completed
+ * workflow writes and ownership records are not rolled back.
  */
 async function provisionRepo(installationId: number, client: Octokit, repo: { name: string; full_name: string; owner: { login: string }; default_branch: string }, credentials: Record<string, string>): Promise<void> {
   const owner = repo.owner.login;
@@ -304,15 +307,22 @@ async function provisionRepo(installationId: number, client: Octokit, repo: { na
   }
   const { data: key } = await client.actions.getRepoPublicKey({ owner, repo: name });
   await sodium.ready;
+  const recordedSecrets = new Set(await store.listManagedSecrets(installationId, repo.full_name));
+  const existingSecrets = await client.paginate(client.actions.listRepoSecrets, { owner, repo: name, per_page: 100 });
   for (const [credentialName, secretName] of secretNames) {
     const value = credentials[credentialName];
     if (!value) continue;
-    const existing = await client.paginate(client.actions.listRepoSecrets, { owner, repo: name, per_page: 100 });
-    if (existing.some((secret) => secret.name === secretName)) continue;
+    if (skipExistingSecret(secretName, repo.full_name, existingSecrets.some((secret) => secret.name === secretName), recordedSecrets.has(secretName))) continue;
     const encrypted = sodium.crypto_box_seal(Buffer.from(value), sodium.from_base64(key.key, sodium.base64_variants.ORIGINAL));
-    const result = await client.actions.createOrUpdateRepoSecret({ owner, repo: name, secret_name: secretName, encrypted_value: sodium.to_base64(encrypted, sodium.base64_variants.ORIGINAL), key_id: key.key_id });
-    if (!secretWasCreated(result.status)) throw new Error(`${repo.full_name}: ${secretName} already existed when Robin attempted to create it; it was not claimed for cleanup`);
-    await store.recordManagedSecret(installationId, repo.full_name, secretName);
+    await createAndTrackSecret({
+      secretName,
+      create: async () => (await client.actions.createOrUpdateRepoSecret({ owner, repo: name, secret_name: secretName, encrypted_value: sodium.to_base64(encrypted, sodium.base64_variants.ORIGINAL), key_id: key.key_id })).status,
+      recordOwnership: () => store.recordManagedSecret(installationId, repo.full_name, secretName),
+      compensateDelete: async () => {
+        try { await client.actions.deleteRepoSecret({ owner, repo: name, secret_name: secretName }); }
+        catch (error: any) { if (error.status !== 404) throw error; }
+      },
+    });
   }
 }
 
@@ -382,11 +392,11 @@ async function cleanupRepo(installationId: number, client: Octokit, repo: { name
 
 /**
  * Apply an active, credentialed installation's policy to accessible, eligible repositories.
- * Provision selected repositories, then clean up excluded tracked repositories; archived,
- * disabled, inaccessible, or branchless repositories retain their existing managed state.
- * None mode still cleans up tracked repositories. Database, authentication, policy,
- * credential-decryption/parsing, and repository operation failures propagate, stopping
- * this pass without rolling back completed work.
+ * Provision selected repositories and clean up excluded tracked repositories independently.
+ * Archived, disabled, inaccessible, or branchless repositories retain their existing managed
+ * state. None mode still cleans up tracked repositories. After every accessible repository
+ * has been attempted, summarize per-repository failures to schedule a retry; database,
+ * authentication, policy, and repository-listing failures stop the pass immediately.
  */
 async function reconcile(installation: Installation): Promise<void> {
   const managed = await store.managedRepositories(installation.id);
@@ -395,22 +405,31 @@ async function reconcile(installation: Installation): Promise<void> {
   const repositories = await appClient.paginate(appClient.apps.listReposAccessibleToInstallation, { per_page: 100 });
   const available = repositories.filter((repo) => !repo.archived && !repo.disabled && repo.default_branch).map((repo) => ({ name: repo.name, full_name: repo.full_name, owner: { login: repo.owner.login }, default_branch: repo.default_branch }));
   const selected = selectRepositories(available, installation.policy);
+  let credentials: Record<string, string> | null = null;
+  let credentialError: string | null = null;
   if (selected.length > 0) {
-    const credentialData = JSON.parse(decryptSecret(installation.credentials!, encryptionSecret)) as { apiKey: string; baseUrl: string; model: string; cfClientId: string; cfClientSecret: string };
-    const credentials: Record<string, string> = { LLM_API_KEY: credentialData.apiKey, LLM_BASE_URL: credentialData.baseUrl, LLM_MODEL: credentialData.model, CF_ACCESS_CLIENT_ID: credentialData.cfClientId, CF_ACCESS_CLIENT_SECRET: credentialData.cfClientSecret };
-    for (const repo of selected) {
-      const client = await githubAppClient(installation.id, repo.name, true);
-      await provisionRepo(installation.id, client, repo, credentials);
+    try {
+      const credentialData = JSON.parse(decryptSecret(installation.credentials!, encryptionSecret)) as { apiKey: string; baseUrl: string; model: string; cfClientId: string; cfClientSecret: string };
+      credentials = { LLM_API_KEY: credentialData.apiKey, LLM_BASE_URL: credentialData.baseUrl, LLM_MODEL: credentialData.model, CF_ACCESS_CLIENT_ID: credentialData.cfClientId, CF_ACCESS_CLIENT_SECRET: credentialData.cfClientSecret };
+    } catch {
+      credentialError = "stored credentials could not be decrypted or parsed";
     }
   }
+  const failures = await processRepositoriesIndependently(selected, "provision", async (repo) => {
+    if (credentialError) throw new Error(credentialError);
+    const client = await githubAppClient(installation.id, repo.name, true);
+    await provisionRepo(installation.id, client, repo, credentials!);
+  });
   const selectedNames = new Set(selected.map((repo) => repo.full_name));
   const byName = new Map(available.map((repo) => [repo.full_name, repo]));
-  for (const repositoryName of managedWorkflowsToCleanup(managed.map((repository) => ({ repository })), [...selectedNames]).map((record) => record.repository)) {
-    const repo = byName.get(repositoryName);
-    if (!repo) continue; // Archived or no longer accessible: retain state and never guess at a write.
+  const cleanupTargets = managedWorkflowsToCleanup(managed.map((repository) => ({ repository })), [...selectedNames])
+    .map((record) => byName.get(record.repository)).filter((repo): repo is NonNullable<typeof repo> => Boolean(repo));
+  failures.push(...await processRepositoriesIndependently(cleanupTargets, "cleanup", async (repo) => {
     const client = await githubAppClient(installation.id, repo.name, true);
     await cleanupRepo(installation.id, client, repo);
-  }
+  }));
+  const failureSummary = summarizeRepositoryFailures(failures);
+  if (failureSummary) throw new Error(failureSummary);
 }
 
 let workerRunning = false;
@@ -444,8 +463,7 @@ async function workOnce(): Promise<void> {
  * database, and server-listen failures.
  */
 async function start(): Promise<void> {
-  const templatePath = process.env.ROBIN_WORKFLOW_TEMPLATE || [path.resolve(process.cwd(), "templates/robin.yml"), path.resolve(process.cwd(), "../templates/robin.yml")].find((candidate) => candidate.endsWith("/templates/robin.yml"));
-  if (!templatePath) throw new Error("ROBIN_WORKFLOW_TEMPLATE is required when templates/robin.yml is not in the working tree");
+  const templatePath = await resolveWorkflowTemplatePath({ cwd: process.cwd(), moduleDirectory: __dirname, configuredPath: process.env.ROBIN_WORKFLOW_TEMPLATE });
   const template = await readFile(templatePath, "utf8");
   workflowText = accountWorkflowTemplate(`# Managed by Robin account controller. Changes made here will stop automated updates.\n${template.replace(/^# Generated by robin-review.*(?:\r?\n|$)/m, "")}`);
   await store.migrate();

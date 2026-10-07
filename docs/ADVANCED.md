@@ -162,6 +162,12 @@ secret was created; an upsert/update response is treated as a conflict. GitHub's
 not offer an atomic create-only operation, so a narrow race remains between the check and
 write. If credentials change, update the `ROBIN_ACCOUNT_*` secrets manually when they
 already exist.
+If a reserved `ROBIN_ACCOUNT_*` secret exists but the controller has no ownership record
+for it, setup stops for that repository and leaves the value untouched. Remove or rename
+that secret manually, then retry setup. If GitHub creates a secret but PostgreSQL fails to
+record ownership, Robin attempts to delete the newly created secret as compensation. The
+controller reports whether that removal succeeded; if it could not remove the secret, it
+may remain untracked and requires manual resolution before retrying.
 User-account installations also use repository secrets, because ordinary repositories
 cannot consume a user-level Actions secret.
 

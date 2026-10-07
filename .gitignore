@@ -6,6 +6,7 @@ skills-lock.json
 *.log
 .env
 .env.*
+!controller/.env.example
 coverage/
 .DS_Store
 .idea/
