@@ -2,24 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createAndTrackSecret, skipExistingSecret } from "./managed-secret.js";
 
-test("new secret ownership failure compensates by deleting the newly created secret", async () => {
+test("ownership recording failure reports the possibly untracked secret without deleting it", async () => {
   const calls: string[] = [];
   await assert.rejects(createAndTrackSecret({
     secretName: "ROBIN_ACCOUNT_LLM_API_KEY",
     create: async () => { calls.push("create"); return 201; },
     recordOwnership: async () => { calls.push("record"); throw new Error("database down"); },
-    compensateDelete: async () => { calls.push("delete"); },
-  }), /newly created secret was removed/);
-  assert.deepEqual(calls, ["create", "record", "delete"]);
-});
-
-test("compensation failure clearly reports the untracked secret", async () => {
-  await assert.rejects(createAndTrackSecret({
-    secretName: "ROBIN_ACCOUNT_LLM_API_KEY",
-    create: async () => 201,
-    recordOwnership: async () => { throw new Error("database down"); },
-    compensateDelete: async () => { throw new Error("GitHub unavailable"); },
-  }), /secret may remain untracked/);
+  }), /database ownership recording failed after HTTP 201; the secret may remain untracked and requires manual cleanup before retrying/);
+  assert.deepEqual(calls, ["create", "record"]);
 });
 
 test("pre-existing secret response is not tracked or deleted", async () => {
@@ -28,7 +18,6 @@ test("pre-existing secret response is not tracked or deleted", async () => {
     secretName: "ROBIN_ACCOUNT_LLM_API_KEY",
     create: async () => 204,
     recordOwnership: async () => { calls.push("record"); },
-    compensateDelete: async () => { calls.push("delete"); },
   }), /HTTP 204/);
   assert.deepEqual(calls, []);
 });

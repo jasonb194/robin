@@ -2,20 +2,13 @@ export async function createAndTrackSecret(input: {
   secretName: string;
   create: () => Promise<number>;
   recordOwnership: () => Promise<void>;
-  compensateDelete: () => Promise<void>;
 }): Promise<void> {
   const status = await input.create();
   if (status !== 201) throw new Error(`${input.secretName}: GitHub did not create the secret (HTTP ${status}); it was not claimed for cleanup`);
   try {
     await input.recordOwnership();
   } catch {
-    let removed = false;
-    try {
-      await input.compensateDelete();
-      removed = true;
-    } catch { /* The safe next step is to report the untracked name for manual resolution. */ }
-    if (removed) throw new Error(`${input.secretName}: database ownership recording failed; the newly created secret was removed`);
-    throw new Error(`${input.secretName}: database ownership recording and compensating deletion both failed; the secret may remain untracked`);
+    throw new Error(`${input.secretName}: database ownership recording failed after HTTP 201; the secret may remain untracked and requires manual cleanup before retrying`);
   }
 }
 

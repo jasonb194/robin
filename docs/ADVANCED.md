@@ -90,7 +90,11 @@ cp .env.example .env
 
 Edit `.env` with the GitHub App credentials, webhook secret, public URL, and database
 password. Generate the encryption key with `openssl rand -base64 32`; use it as
-`ENCRYPTION_KEY`. Generate a separate strong `POSTGRES_PASSWORD`. Keep `.env` private and
+`ENCRYPTION_KEY`. Generate a separate strong `POSTGRES_PASSWORD`. Percent-encode its value
+in `DATABASE_URL`, including literal `%` as `%25` and reserved characters such as `@` as
+`%40`. Keep `POSTGRES_PASSWORD` unencoded for Docker Compose and quote it as needed by Compose's
+`.env` syntax (single-quoted values preserve literal `$` characters). Both values must refer
+to the same password. Keep `.env` private and
 back up the PostgreSQL volume and encryption key separately. The database contains
 encrypted LLM credentials and installation policy; losing the encryption key makes saved
 credentials unreadable. Do not commit `.env` or put the App private key, OAuth secret,
@@ -110,7 +114,7 @@ The required environment variables are:
 | `APP_CLIENT_SECRET` | GitHub App OAuth client secret. |
 | `WEBHOOK_SECRET` | Secret used to verify GitHub webhook signatures. |
 | `PUBLIC_URL` | Public HTTPS base URL, without a trailing slash. |
-| `DATABASE_URL` | PostgreSQL connection URL. Compose's example uses the `db` service. |
+| `DATABASE_URL` | PostgreSQL connection URL. Percent-encode its password, including literal `%` as `%25` and reserved characters (for example, `@` as `%40`). Compose's example uses the `db` service. |
 | `ENCRYPTION_KEY` | Base64 encoding of exactly 32 random bytes for stored credentials. |
 | `POSTGRES_PASSWORD` | Database password used by the Compose PostgreSQL service. |
 | `TRUST_PROXY_CIDRS` | Optional comma-separated IPs/CIDRs for trusted reverse proxies; empty by default. |
@@ -165,9 +169,9 @@ already exist.
 If a reserved `ROBIN_ACCOUNT_*` secret exists but the controller has no ownership record
 for it, setup stops for that repository and leaves the value untouched. Remove or rename
 that secret manually, then retry setup. If GitHub creates a secret but PostgreSQL fails to
-record ownership, Robin attempts to delete the newly created secret as compensation. The
-controller reports whether that removal succeeded; if it could not remove the secret, it
-may remain untracked and requires manual resolution before retrying.
+record ownership, the secret may remain untracked. Robin reports the failure without
+deleting by name, since an administrator could replace the secret before cleanup. Remove or
+rename the untracked secret manually, then retry setup.
 User-account installations also use repository secrets, because ordinary repositories
 cannot consume a user-level Actions secret.
 

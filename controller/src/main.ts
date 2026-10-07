@@ -231,8 +231,9 @@ const secretNames = Object.entries(ACCOUNT_SECRET_NAMES) as Array<[AccountSecret
  * Record workflow ownership and secrets reported newly created with HTTP 201.
  * Tracked existing names are skipped; untracked reserved names fail visibly, and
  * discovery/upsert are not atomic. If ownership recording fails after secret creation,
- * attempt to remove that secret and report any unresolved remote state. Other completed
- * workflow writes and ownership records are not rolled back.
+ * report that the secret may remain untracked for manual cleanup; do not delete it because
+ * GitHub addresses deletion by name and an administrator could have replaced it. Other
+ * completed workflow writes and ownership records are not rolled back.
  */
 async function provisionRepo(installationId: number, client: Octokit, repo: { name: string; full_name: string; owner: { login: string }; default_branch: string }, credentials: Record<string, string>): Promise<void> {
   const owner = repo.owner.login;
@@ -318,10 +319,6 @@ async function provisionRepo(installationId: number, client: Octokit, repo: { na
       secretName,
       create: async () => (await client.actions.createOrUpdateRepoSecret({ owner, repo: name, secret_name: secretName, encrypted_value: sodium.to_base64(encrypted, sodium.base64_variants.ORIGINAL), key_id: key.key_id })).status,
       recordOwnership: () => store.recordManagedSecret(installationId, repo.full_name, secretName),
-      compensateDelete: async () => {
-        try { await client.actions.deleteRepoSecret({ owner, repo: name, secret_name: secretName }); }
-        catch (error: any) { if (error.status !== 404) throw error; }
-      },
     });
   }
 }
