@@ -8,9 +8,11 @@ export const ACCOUNT_SECRET_NAMES = {
 
 export type AccountSecretKey = keyof typeof ACCOUNT_SECRET_NAMES;
 
+/** Replace supported LLM and Cloudflare secret expressions with their ROBIN_ACCOUNT_ names. */
 export function accountWorkflowTemplate(template: string): string {
   return template.replace(/\$\{\{\s*secrets\.(LLM_API_KEY|LLM_BASE_URL|LLM_MODEL|CF_ACCESS_CLIENT_ID|CF_ACCESS_CLIENT_SECRET)\s*\}\}/g,
     (_expression, name: AccountSecretKey) => `\${{ secrets.${ACCOUNT_SECRET_NAMES[name]} }}`);
 }
 
+/** True only for HTTP 201, which permits recording ownership of a newly created secret. */
 export function secretWasCreated(status: number): boolean { return status === 201; }

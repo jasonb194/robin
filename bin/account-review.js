@@ -11,6 +11,7 @@ const { selectRepositories } = require("./repo-selection");
 const MODES = ["all", "none", "all-but", "only"];
 const SECRET_NAMES = ["LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"];
 const TEMPLATE_PATH = path.resolve(__dirname, "..", "templates", "robin.yml");
+/** Normalize CRLF and trailing whitespace for workflow comparison, ending with one newline. */
 const normalize = (content) => content.replace(/\r\n/g, "\n").trimEnd() + "\n";
 const accountHelp = `Usage:
   npx robin-review --org <owner> [options]
@@ -34,6 +35,10 @@ In non-interactive mode, provide environment variables for missing secrets with
 environment; provide both values if both secrets are missing.
 `;
 
+/**
+ * Parse a name: or regex: selector without validating its value or pattern.
+ * @throws {TypeError} If the input is not a string with a recognized prefix.
+ */
 function parseSelector(value) {
   if (typeof value !== "string") throw new TypeError("selector must be a string");
   if (value.startsWith("name:")) return { type: "name", value: value.slice(5) };
@@ -41,6 +46,12 @@ function parseSelector(value) {
   throw new TypeError(`invalid selector ${JSON.stringify(value)}; use name:<repo> or regex:<pattern>`);
 }
 
+/**
+ * Parse account bootstrap arguments, excluding the executable and script names.
+ * Help bypasses final target and policy checks; selector values are validated later.
+ * @throws {TypeError} For unknown options, missing values, conflicting targets,
+ * invalid logins or modes, or selectors supplied with all/none mode.
+ */
 function parseArgs(argv) {
   const options = { targetType: null, target: null, mode: null, selectors: [], dryRun: false, yes: false, skipSecrets: false, help: false };
   for (let index = 0; index < argv.length; index += 1) {
@@ -88,6 +99,12 @@ function parseArgs(argv) {
   return options;
 }
 
+/**
+ * Create synchronous GitHub CLI operations using the supplied process runner and environment.
+ * Child processes omit the supported LLM and Cloudflare secret variables, and secret
+ * writes pass values through stdin. Operations propagate command and JSON errors;
+ * getWorkflow returns null when the error text contains HTTP 404 or Not Found.
+ */
 function createGhAdapter(execFileSync = cp.execFileSync, environment = process.env) {
   const run = (args, input) => execFileSync("gh", args, {
     encoding: "utf8",
@@ -98,6 +115,7 @@ function createGhAdapter(execFileSync = cp.execFileSync, environment = process.e
   const api = (endpoint) => JSON.parse(run(["api", endpoint]));
   return {
     authenticatedUser: () => api("user"),
+    /** List all accessible organization repositories, or the authenticated user's owned repositories; target applies only to org scope. */
     repositories: (type, target) => {
       const endpoint = type === "org"
         ? `orgs/${encodeURIComponent(target)}/repos?per_page=100&sort=full_name`
@@ -116,6 +134,7 @@ function createGhAdapter(execFileSync = cp.execFileSync, environment = process.e
         throw error;
       }
     },
+    /** Request creation of robin.yml on the default branch; command and JSON errors propagate. */
     createWorkflow: (repository, content) => {
       const body = {
         message: "chore: install Robin review workflow",
@@ -132,9 +151,11 @@ function createGhAdapter(execFileSync = cp.execFileSync, environment = process.e
       const result = run(["secret", "list", "--org", organization, "--json", "name"]);
       return JSON.parse(result).map(({ name }) => name);
     },
+    /** Upsert an Actions repository secret; callers must check whether it already exists. */
     setRepositorySecret: (repository, name, value) => {
       run(["secret", "set", name, "--repo", repository.full_name, "--app", "actions"], value);
     },
+    /** Upsert an Actions organization secret restricted to the supplied repositories. */
     setOrganizationSecret: (organization, repositories, name, value) => {
       const repoNames = repositories.map((repository) => repository.name).join(",");
       run(["secret", "set", name, "--org", organization, "--repos", repoNames, "--app", "actions"], value);
@@ -142,6 +163,10 @@ function createGhAdapter(execFileSync = cp.execFileSync, environment = process.e
   };
 }
 
+/**
+ * Build the Robin workflow contents API path, using default_branch as the ref when present.
+ * @throws {TypeError} If full_name does not contain exactly two nonempty path components.
+ */
 function contentsEndpoint(repository) {
   const [owner, name] = String(repository.full_name || "").split("/");
   if (!owner || !name || repository.full_name.split("/").length !== 2) {
@@ -151,6 +176,7 @@ function contentsEndpoint(repository) {
   return `repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/contents/.github/workflows/robin.yml${ref}`;
 }
 
+/** Return an error message with every literal occurrence of a nonempty secret value redacted. */
 function safeSecretError(error, secretValue) {
   const message = error && (error.message || String(error));
   return typeof secretValue === "string" && secretValue.length > 0
@@ -158,6 +184,11 @@ function safeSecretError(error, secretValue) {
     : String(message);
 }
 
+/**
+ * Return a validated policy, prompting for missing mode or selectors only in interactive mode.
+ * Reject with TypeError for invalid policies or required non-interactive inputs;
+ * prompt failures also propagate.
+ */
 async function collectPolicy(options, prompt, isInteractive) {
   let mode = options.mode;
   if (!mode) {
@@ -178,6 +209,10 @@ async function collectPolicy(options, prompt, isInteractive) {
   return policy;
 }
 
+/**
+ * Read one terminal answer without echoing it and close the prompt afterward.
+ * Return the untrimmed answer; input failures propagate.
+ */
 async function promptSecret(message) {
   stdout.write(message);
   const hiddenOutput = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
@@ -191,6 +226,7 @@ async function promptSecret(message) {
   }
 }
 
+/** Return the original values unchanged, throwing TypeError for nonstrings or blank values. */
 function validateSecretValues(values) {
   for (const [name, value] of Object.entries(values)) {
     if (typeof value !== "string" || value.trim().length === 0) {
@@ -200,6 +236,12 @@ function validateSecretValues(values) {
   return values;
 }
 
+/**
+ * Collect values for the missing secret names, or return null when setup is skipped or declined.
+ * Cloudflare values must come from env. Other values may use hidden interactive input;
+ * non-interactive setup requires all values in env and --yes. Reject missing or blank
+ * values, invalid confirmation, or unavailable hidden input; prompt failures propagate.
+ */
 async function getSecretValues(options, prompt, readSecret, isInteractive, env, names) {
   if (options.skipSecrets) return null;
   const configured = names.filter((name) => env[name]);
@@ -233,6 +275,13 @@ async function getSecretValues(options, prompt, readSecret, isInteractive, env, 
   return validateSecretValues(values);
 }
 
+/**
+ * Plan missing Actions secret writes without applying them, collecting values only as needed.
+ * Use organization scope for --org and repository scope for --user. Include Cloudflare
+ * secrets only when either Cloudflare environment value is present. Return operations,
+ * a skipped count, and declined when value collection is declined. Discovery failures
+ * skip the affected scope; value collection and validation failures propagate.
+ */
 async function prepareSecrets(options, repositories, dependencies) {
   const { gh, prompt, readSecret, write, isInteractive, env } = dependencies;
   if (repositories.length === 0 || options.skipSecrets) return { operations: [], skipped: 0 };
@@ -282,6 +331,11 @@ async function prepareSecrets(options, repositories, dependencies) {
   return { operations, skipped };
 }
 
+/**
+ * Apply planned secret writes after refreshing existing names before each write.
+ * Return configured, skipped, and failed counts; discovery and write failures count
+ * as failed operations and processing continues. The check and upsert are not atomic.
+ */
 async function executeSecretPlan(options, secretPlan, gh, write) {
   let configured = 0;
   let failed = 0;
@@ -314,6 +368,11 @@ async function executeSecretPlan(options, secretPlan, gh, write) {
   return { configured, skipped, failed };
 }
 
+/**
+ * Classify a workflow as create, current, or skipped without changing the repository.
+ * Skip archived repositories, missing default branches, and existing nonmatching files.
+ * Comparison ignores CRLF differences and trailing whitespace. Lookup errors propagate.
+ */
 async function workflowStatus(repository, gh, template) {
   if (repository.archived) return { status: "skipped", reason: "archived repository" };
   if (!repository.default_branch) return { status: "skipped", reason: "no default branch" };
@@ -326,6 +385,19 @@ async function workflowStatus(repository, gh, template) {
   return { status: "skipped", reason: "workflow file already exists; preserving it" };
 }
 
+/**
+ * Bootstrap currently accessible repositories selected by an account policy.
+ * Create missing workflows and optionally missing Actions secrets after confirmation
+ * (or --yes). Existing workflows are preserved; secrets apply only to current or
+ * successfully created workflows. Dry runs return the workflow plan before secret setup.
+ *
+ * Return a help, no-op, dry-run, cancelled, or complete result; complete results include
+ * the plan and workflow/secret counts. Per-repository workflow errors and secret write
+ * errors are counted, and secret discovery failures skip that scope. Argument, policy,
+ * credential, confirmation, template-read, user-authentication, and repository-listing
+ * errors propagate. Dependencies may override GitHub operations, I/O, template text,
+ * interactivity, and the environment used to collect secret values.
+ */
 async function runAccountReview(argv, dependencies = {}) {
   const options = parseArgs(argv);
   const write = dependencies.write || ((message) => stdout.write(`${message}\n`));

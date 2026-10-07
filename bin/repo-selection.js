@@ -12,6 +12,12 @@ const MAX_PATTERN_LENGTH = 512;
  * use RE2JS, so matching has linear-time behavior even for untrusted patterns.
  * Results are sorted by repository name to stay stable across API page order.
  *
+ * Regex selectors match any part of a name case-insensitively. only includes
+ * matches to any selector; all-but excludes them. all/none reject selectors,
+ * while only/all-but require at least one. The input array is not modified.
+ *
+ * @throws {TypeError} For invalid repositories, policies, or selectors, including
+ * invalid RE2 patterns and regex values longer than 512 characters.
  * @param {Array<{name: string}>} repositories
  * @param {{mode: string, selectors?: Array<{type: string, value: string}>}} policy
  * @returns {Array<{name: string}>}

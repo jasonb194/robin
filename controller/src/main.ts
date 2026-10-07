@@ -11,6 +11,7 @@ import { accountConfirmationProvided, contentHash, installationTokenOptions, man
 import { Store, type Installation } from "./store.js";
 import { ACCOUNT_SECRET_NAMES, accountWorkflowTemplate, secretWasCreated, type AccountSecretKey } from "./account-workflow.js";
 
+/** Read a required environment value, throwing if it is unset or empty. */
 const required = (name: string) => { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value; };
 const appId = required("APP_ID");
 const privateKey = required("APP_PRIVATE_KEY").replace(/\\n/g, "\n");
@@ -168,6 +169,7 @@ app.post<{ Headers: { "x-hub-signature-256"?: string; "x-github-delivery"?: stri
   return reply.code(202).send({ accepted: true });
 });
 
+/** Render the account policy and credential form with the account login and type HTML-escaped. */
 function renderSetupForm(login: string, type: string): string {
   const safe = escapeHtml(`${login} (${type})`);
   return `<!doctype html><html><head><meta charset="utf-8"><title>Set up Robin</title></head><body><main><h1>Configure Robin for ${safe}</h1><form method="post" action="/setup/policy">
@@ -181,19 +183,33 @@ function renderSetupForm(login: string, type: string): string {
     <label>Optional Cloudflare Access client secret <input name="cf-access-client-secret" type="password"></label>
     <button type="submit">Save and configure repositories</button></form></main></body></html>`;
 }
+/** Escape ampersands, angle brackets, and both quote characters for HTML text or attributes. */
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!); }
+/** Decode a UTF-8 URL-encoded form; when keys repeat, keep the last value. */
 function parseForm(body: Buffer): Record<string, string> { return Object.fromEntries(new URLSearchParams(body.toString("utf8")).entries()); }
 
+/**
+ * Create an installation-authenticated GitHub client, optionally restricted to one repository.
+ * Use metadata-only permissions unless write is true. Authentication failures propagate.
+ */
 function githubAppClient(installationId: number, repositoryName?: string, write = false): Promise<Octokit> {
   return createAppAuth({ appId, privateKey })(installationTokenOptions(installationId, repositoryName, write) as any).then((auth) => new Octokit({ auth: auth.token }));
 }
 
+/**
+ * Return a bounded message for plain Error instances and a generic message for other errors.
+ * Preserve a nonzero numeric status when present; plain Error messages are not redacted.
+ */
 function safeError(error: unknown): { message: string; status?: number } {
   const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status : undefined;
   if (error instanceof Error && error.constructor === Error) return { message: error.message.slice(0, 1000), ...(status ? { status } : {}) };
   return { message: status ? `GitHub request failed (HTTP ${status})` : "Unexpected controller error", ...(status ? { status } : {}) };
 }
 
+/**
+ * Verify that a setup PR changes only robin-account.yml and its head content matches desiredHash.
+ * Reject unsafe diffs or mismatched/non-file content; GitHub lookup failures propagate.
+ */
 async function assertSafeSetupPullRequest(client: Octokit, owner: string, repo: string, pull: { number: number; head: { sha: string } }, desiredHash: string): Promise<void> {
   const files = await client.paginate(client.pulls.listFiles, { owner, repo, pull_number: pull.number, per_page: 100 });
   if (!safeWorkflowDiff(files.map((file) => file.filename))) throw new Error(`${owner}/${repo}: setup PR contains unrelated file changes; leaving it unchanged`);
@@ -204,6 +220,17 @@ async function assertSafeSetupPullRequest(client: Octokit, owner: string, repo: 
 let workflowText = "";
 const secretNames = Object.entries(ACCOUNT_SECRET_NAMES) as Array<[AccountSecretKey, string]>;
 
+/**
+ * Install or update the managed account workflow and add missing credential secrets.
+ * Refuse workflow content that matches neither the desired nor recorded prior hash.
+ * Direct-write HTTP 403, 409, or 422 failures trigger a setup branch/PR fallback;
+ * existing setup branches and PRs must pass ownership and content checks.
+ *
+ * Record workflow ownership and secrets reported newly created with HTTP 201.
+ * Existing secret names are skipped, but discovery and upsert are not atomic.
+ * Ownership conflicts and remaining GitHub, database, or encryption errors propagate;
+ * completed remote writes and ownership records are not rolled back.
+ */
 async function provisionRepo(installationId: number, client: Octokit, repo: { name: string; full_name: string; owner: { login: string }; default_branch: string }, credentials: Record<string, string>): Promise<void> {
   const owner = repo.owner.login;
   const name = repo.name;
@@ -289,6 +316,15 @@ async function provisionRepo(installationId: number, client: Octokit, repo: { na
   }
 }
 
+/**
+ * Remove an excluded repository's unchanged tracked workflow and recorded owned secrets.
+ * Close its tracked open setup PR, leaving the branch intact. Preserve edited workflows
+ * and their secrets while dropping ownership records. Without workflow ownership,
+ * preserve an existing workflow and forget secret ownership; if absent, delete tracked secrets.
+ *
+ * Missing workflows or secrets (HTTP 404) permit cleanup to continue. Unsafe paths,
+ * other GitHub failures, and database errors reject; cleanup may be partially applied.
+ */
 async function cleanupRepo(installationId: number, client: Octokit, repo: { name: string; full_name: string; owner: { login: string }; default_branch: string }): Promise<void> {
   const { owner, name } = { owner: repo.owner.login, name: repo.name };
   const deleteTrackedSecrets = async () => {
@@ -344,6 +380,14 @@ async function cleanupRepo(installationId: number, client: Octokit, repo: { name
   await deleteTrackedSecrets();
 }
 
+/**
+ * Apply an active, credentialed installation's policy to accessible, eligible repositories.
+ * Provision selected repositories, then clean up excluded tracked repositories; archived,
+ * disabled, inaccessible, or branchless repositories retain their existing managed state.
+ * None mode still cleans up tracked repositories. Database, authentication, policy,
+ * credential-decryption/parsing, and repository operation failures propagate, stopping
+ * this pass without rolling back completed work.
+ */
 async function reconcile(installation: Installation): Promise<void> {
   const managed = await store.managedRepositories(installation.id);
   if (!shouldReconcile(installation.active, Boolean(installation.credentials), installation.policy, managed.length)) return;
@@ -370,6 +414,11 @@ async function reconcile(installation: Installation): Promise<void> {
 }
 
 let workerRunning = false;
+/**
+ * Process at most one queued job, returning immediately if this worker is already running.
+ * Missing installations complete without reconciliation. Processing failures schedule a
+ * retry; job-claim or retry-recording failures propagate. Always release the local worker guard.
+ */
 async function workOnce(): Promise<void> {
   if (workerRunning) return;
   workerRunning = true;
@@ -388,6 +437,12 @@ async function workOnce(): Promise<void> {
   } finally { workerRunning = false; }
 }
 
+/**
+ * Load the workflow template, prepare database tables, prune expired state, and listen for HTTP.
+ * Start job polling every second, pruning every hour, and reconciliation scheduling
+ * every 15 minutes. Reject invalid port configuration and propagate template-read,
+ * database, and server-listen failures.
+ */
 async function start(): Promise<void> {
   const templatePath = process.env.ROBIN_WORKFLOW_TEMPLATE || [path.resolve(process.cwd(), "templates/robin.yml"), path.resolve(process.cwd(), "../templates/robin.yml")].find((candidate) => candidate.endsWith("/templates/robin.yml"));
   if (!templatePath) throw new Error("ROBIN_WORKFLOW_TEMPLATE is required when templates/robin.yml is not in the working tree");

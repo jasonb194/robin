@@ -3,6 +3,11 @@ import { RE2JS } from "re2js";
 export type Selector = { type: "name" | "regex"; value: string };
 export type Policy = { mode: "all" | "none" | "all-but" | "only"; selectors: Selector[] };
 
+/**
+ * Return a policy with copied selectors, preserving selector values without trimming.
+ * @throws For malformed policy fields, selectors with all/none, missing selectors
+ * with only/all-but, blank values, values longer than 512 characters, or invalid RE2 patterns.
+ */
 export function validatePolicy(value: unknown): Policy {
   if (!value || typeof value !== "object") throw new Error("policy must be an object");
   const raw = value as Record<string, unknown>;
@@ -24,6 +29,12 @@ export function validatePolicy(value: unknown): Policy {
   return { mode, selectors };
 }
 
+/**
+ * Select by a validated policy and return a new array sorted by repository name.
+ * Names match exactly and regexes match substrings, both case-insensitively; only
+ * includes any match and all-but excludes any match. all includes every repository
+ * and none includes none. Invalid regex compilation errors propagate.
+ */
 export function selectRepositories<T extends { name: string }>(repositories: T[], policy: Policy): T[] {
   const names = new Set(policy.selectors.filter((s) => s.type === "name").map((s) => s.value.toLowerCase()));
   const regexes = policy.selectors.filter((s) => s.type === "regex").map((s) => RE2JS.compile(s.value, RE2JS.CASE_INSENSITIVE));
