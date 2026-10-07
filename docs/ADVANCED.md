@@ -2,7 +2,194 @@
 
 This document is for maintainers and power users. For a short setup, see the [README](../README.md).
 
+## GitHub App account controller
+
+The GitHub App controller is Robin's one-time account installation path. Install the App
+once for an organization or user account, set a repository policy, and the controller
+configures matching repositories it can access. It also reconciles periodically and when
+GitHub sends installation or repository events, so matching repositories created later are
+picked up. This control plane is separate from the existing GitHub Action: review jobs
+still run in each repository through Robin's reusable workflow.
+
+Robin does not operate a hosted controller service. The package in `controller/` is a
+self-hostable service; you provide its server, public HTTPS endpoint, PostgreSQL database,
+and operations. The existing [bulk CLI bootstrap](#account-level-bootstrap) remains a
+one-time alternative if you do not want to maintain a service.
+
+### Register the GitHub App
+
+Create a GitHub App for your GitHub.com account and set:
+
+- **Webhook URL:** `https://<your-controller-host>/webhooks/github`
+- **Webhook secret:** a generated secret matching `WEBHOOK_SECRET` in the controller
+- **Setup URL:** `https://<your-controller-host>/setup`
+- **Callback URL:** `https://<your-controller-host>/setup/callback` in the App's OAuth
+  settings
+- **Repository permissions:** Metadata (read), Contents (read and write), Actions (read
+  and write), Workflows (write), and Pull requests (write)
+- **Organization permissions:** Members (read), so setup can verify the signed-in user is
+  an active organization admin before applying an account-wide policy
+- **Subscribe to events:** `installation`, `installation_repositories`, and `repository`
+
+At installation, grant the App access to **all repositories** in the organization or user
+account. The App must be able to discover future repositories; the controller applies the
+policy locally before writing a workflow. Granting access to all repositories does not
+mean all repositories will be reviewed when the policy is `none`, `only`, or `all-but`.
+
+The controller setup page asks the installing account to authorize access to the
+installation, then presents the repository policy and LLM credentials. The user must own a
+personal-account installation or be an active organization admin. The setup flow requests
+`read:user read:org`, binds its one-time OAuth state to a short-lived secure browser cookie,
+verifies org membership using the App's Organization Members (read) permission, and revokes
+the temporary user token before saving a setup session. The form shows the verified account
+and requires an explicit confirmation before accepting policy and credentials. The GitHub
+App installation ID in a setup URL is not proof of authority. An organization owner must
+approve the Members (read) permission when installing the App. Use an HTTPS deployment URL,
+and configure GitHub's webhook endpoint and OAuth callback exactly as above.
+
+### Repository policy
+
+The setup form accepts four modes:
+
+| Mode | Effect |
+| --- | --- |
+| `all` | Configure every eligible repository accessible to the App. |
+| `none` | Do not configure any repositories. |
+| `all-but` | Configure all eligible repositories except those matching a selector. |
+| `only` | Configure only eligible repositories matching a selector. |
+
+Selectors are entered one per line as `name:<repo>` or `regex:<pattern>`. Exact names are
+case-insensitive and compare only the repository name, not `owner/name`. Regex patterns
+use RE2 syntax, are case-insensitive, match any part of the name, and may contain up to
+512 characters. `all` and `none` take no selectors; `all-but` and `only` require at least
+one. For example, select `all-but` in the mode field and enter these selectors:
+
+```text
+name:website
+regex:^archive-
+```
+
+Eligible repositories must be unarchived, enabled, and have a default branch. GitHub
+installation scope still controls which repositories the App can see.
+
+Enter an HTTPS LLM base URL. HTTP is accepted only for localhost or loopback test
+endpoints; use TLS for external providers.
+
+### Deploy with Docker Compose
+
+The self-hostable deployment is in [`controller/`](../controller/). It runs the service
+and PostgreSQL with a persistent database volume. Compose binds the controller to
+`127.0.0.1:3000` by default. Put a TLS reverse proxy or equivalent HTTPS ingress in front
+of it; configure `PUBLIC_URL` with that public HTTPS URL. The service expects GitHub's
+webhooks and the setup OAuth callback to reach that URL.
+
+```bash
+cd controller
+cp .env.example .env
+```
+
+Edit `.env` with the GitHub App credentials, webhook secret, public URL, and database
+password. Generate the encryption key with `openssl rand -base64 32`; use it as
+`ENCRYPTION_KEY`. Generate a separate strong `POSTGRES_PASSWORD`. Keep `.env` private and
+back up the PostgreSQL volume and encryption key separately. The database contains
+encrypted LLM credentials and installation policy; losing the encryption key makes saved
+credentials unreadable. Do not commit `.env` or put the App private key, OAuth secret,
+webhook secret, or encryption key in a repository.
+
+```bash
+docker compose up -d --build
+```
+
+The required environment variables are:
+
+| Variable | Purpose |
+| --- | --- |
+| `APP_ID` | GitHub App ID. |
+| `APP_PRIVATE_KEY` | GitHub App private key PEM; literal `\n` line breaks are accepted. |
+| `APP_CLIENT_ID` | GitHub App OAuth client ID. |
+| `APP_CLIENT_SECRET` | GitHub App OAuth client secret. |
+| `WEBHOOK_SECRET` | Secret used to verify GitHub webhook signatures. |
+| `PUBLIC_URL` | Public HTTPS base URL, without a trailing slash. |
+| `DATABASE_URL` | PostgreSQL connection URL. Compose's example uses the `db` service. |
+| `ENCRYPTION_KEY` | Base64 encoding of exactly 32 random bytes for stored credentials. |
+| `POSTGRES_PASSWORD` | Database password used by the Compose PostgreSQL service. |
+| `TRUST_PROXY_CIDRS` | Optional comma-separated IPs/CIDRs for trusted reverse proxies; empty by default. |
+
+`PORT` defaults to `3000`. For a managed/external PostgreSQL service, set `DATABASE_URL`
+accordingly and configure `PGSSL=true` when TLS is required by that service. The controller
+does not provide TLS termination, hosting, backups, or key rotation. If the reverse proxy
+connects from another address, set `TRUST_PROXY_CIDRS` to the exact proxy IP or CIDR ranges;
+never trust broad or untrusted networks. The controller defaults to trusting no proxy
+headers. Without a configured trusted proxy, clients behind one proxy share the same setup
+rate-limit bucket. Back up the database and `ENCRYPTION_KEY` as a pair, restrict access to
+both, and plan a maintenance window for key rotation because no automatic rotation workflow
+is provided.
+
+After deployment, create the App's installation link and install it on the target account.
+The `/setup` page verifies the signed-in GitHub user's access to the selected installation
+before accepting a policy and credentials. It then queues repository reconciliation.
+`GET /healthz` reports service and database availability; webhook work is queued and
+processed asynchronously, and periodic reconciliation repairs missed events. Check
+container logs for per-repository conflicts or permission failures.
+
+### Workflow and secret behavior
+
+For each selected repository, the controller creates or updates
+`.github/workflows/robin-account.yml` on the default branch. It only updates that path when
+it finds Robin's managed marker and the file still matches the last version the controller
+wrote. An unrelated file or a locally edited managed file is left untouched and reported
+as a conflict. The generated workflow calls Robin's reusable workflow at `@main` and runs
+on pull request open/reopen/ready-for-review plus new issue comments.
+
+The controller first tries to write directly to the default branch. If GitHub rejects the
+write with a branch-protection or repository-rule conflict, it creates or updates the
+`robin/account-setup-<installation-id>` branch and opens a setup pull request against the
+default branch. The installation-specific branch name avoids collisions between accounts;
+the controller checks that an existing branch is its own before changing it. The App needs
+Pull requests write permission for this fallback. Review and merge the setup PR to enable
+Robin; the controller does not bypass repository rules. If a prior setup PR is closed
+without merging, check the controller log and repository state before retrying.
+
+LLM values are stored encrypted in PostgreSQL and set as repository Actions secrets using
+GitHub's repository public key. The account workflow reads `ROBIN_ACCOUNT_LLM_API_KEY`,
+`ROBIN_ACCOUNT_LLM_BASE_URL`, `ROBIN_ACCOUNT_LLM_MODEL`,
+`ROBIN_ACCOUNT_CF_ACCESS_CLIENT_ID`, and `ROBIN_ACCOUNT_CF_ACCESS_CLIENT_SECRET`. Treat
+these `ROBIN_ACCOUNT_*` names as reserved for the controller. Existing standard
+`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `CF_ACCESS_CLIENT_ID`, and
+`CF_ACCESS_CLIENT_SECRET` values are left untouched. Before writing each Robin secret, the
+controller checks for that name and records ownership only when GitHub confirms a new
+secret was created; an upsert/update response is treated as a conflict. GitHub's API does
+not offer an atomic create-only operation, so a narrow race remains between the check and
+write. If credentials change, update the `ROBIN_ACCOUNT_*` secrets manually when they
+already exist.
+User-account installations also use repository secrets, because ordinary repositories
+cannot consume a user-level Actions secret.
+
+When a repository stops matching the saved policy, the controller removes its generated
+workflow only if the file still exactly matches the last version Robin wrote. It then
+removes only `ROBIN_ACCOUNT_*` names it recorded as created by Robin. Existing standard or
+pre-existing namespaced secrets are not recorded or deleted. If someone edited the
+workflow, Robin preserves the edit and its associated secrets. A branch rule that blocks
+workflow deletion also leaves the workflow and secrets in place and is reported in
+controller logs; clean those up manually if needed. Do not edit the reserved
+`ROBIN_ACCOUNT_*` secrets if you want Robin to remove them when their repository is
+deselected.
+
+Suspending the App pauses controller reconciliation but retains its encrypted credentials;
+workflows already installed in repositories continue to run reviews while suspended. An
+`unsuspend` event reactivates a configured installation and queues reconciliation. When the
+App is uninstalled, the controller clears its stored credentials; GitHub access is revoked,
+so generated workflow files and repository secrets may remain and continue running reviews.
+Removing a repository from the App's installation scope can also leave its workflow and
+secrets in place because the controller no longer has permission to clean them up. Remove
+these files and secrets manually if you want to stop reviews. Per-repository failures do
+not stop reconciliation of other repositories.
+
 ## Account-level bootstrap
+
+The CLI bootstrap is a one-time fallback for users who do not want to deploy the GitHub App
+controller. It installs the workflow and optionally configures Actions secrets in currently
+accessible repositories; repositories created later require running the command again.
 
 Use `npx robin-review --org <owner>` or `--user <login>` to bootstrap Robin across
 repositories accessible to an organization or owned by a user. This is a bulk installer

@@ -76,10 +76,44 @@ Prefer to do it by hand, or read the installer first? It's
 [bin/robin-review.js](bin/robin-review.js) (npm) / [scripts/install.sh](scripts/install.sh)
 (curl) — or follow the manual 3 steps instead.
 
-### Install across an account
+### Install once for an organization or user account
 
-To bootstrap several repositories in one run, use the npm installer with GitHub CLI
-(`gh`) authenticated to an account that can access the target repositories:
+For ongoing account-level setup, install the Robin GitHub App once on an organization or
+user account. The controller applies your repository policy to repositories the App can
+access, including repositories created later. Robin does not host this controller; you
+must deploy it on your own server with a public HTTPS URL and PostgreSQL. See the
+[GitHub App controller setup](docs/ADVANCED.md#github-app-account-controller) for App
+registration, permissions, deployment, and operations.
+
+During setup, choose one policy:
+
+- `all`: review every eligible repository.
+- `none`: configure no repositories.
+- `all-but`: review every eligible repository except matching names.
+- `only`: review only matching names.
+
+Selectors can match an exact repository name (case-insensitive) or a repository name with
+a regex. The App needs access to all repositories in the account for `all` and for new
+repositories to be discovered; the saved policy decides which repositories receive Robin's
+workflow.
+
+The self-hosted controller writes a managed workflow and adds repository Actions secrets
+under reserved `ROBIN_ACCOUNT_*` names; existing standard `LLM_*` secrets are preserved.
+It writes directly to each repository's default branch when allowed; if branch protection
+or repository rules block that write, it opens a setup pull request for review. When a
+repository stops matching, it removes only an unchanged workflow it manages and the
+`ROBIN_ACCOUNT_*` secrets it created. Uninstalling or suspending the App can leave existing
+workflows running; remove those workflows and any remaining secrets manually if you want to
+stop reviews. Removing a repository from the App's access can also leave its workflow and
+secrets behind. Use HTTPS for external LLM endpoints.
+
+### One-time bulk setup (CLI alternative)
+
+If you do not want to operate a GitHub App controller, the npm installer can bootstrap the
+repositories currently accessible to an organization or owned by a user. This is a
+one-time operation; it provisions repositories separately and does not enroll future
+repositories automatically. Run it with GitHub CLI (`gh`) authenticated to an account that
+can access the target repositories:
 
 ```bash
 npx robin-review --org YOUR_ORG --mode all
@@ -142,9 +176,7 @@ LLM_API_KEY='…' LLM_BASE_URL='https://openrouter.ai/api/v1' LLM_MODEL='openrou
 The GitHub CLI needs permission to list and update the selected repositories. Adding
 organization Actions secrets also requires permission to manage organization Actions
 secrets. See [account bootstrap details](docs/ADVANCED.md#account-level-bootstrap) for
-the full behavior and limitations. This is a one-time bulk bootstrap: repositories created
-later are not enrolled automatically, so rerun the command to include them. For automatic
-enrollment of future repositories, an account-level GitHub App service would be needed.
+the full behavior and limitations.
 
 ## Setup in 3 steps
 

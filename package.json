@@ -29,7 +29,9 @@
     "dev": "ts-node src/main.ts",
     "lint": "eslint src/**/*.ts",
     "test": "jest",
-    "package": "ncc build dist/index.js -o dist --license licenses.txt && npm run clean"
+    "package": "ncc build dist/index.js -o dist --license licenses.txt && npm run clean",
+    "controller:build": "npm --prefix controller run build",
+    "controller:test": "npm --prefix controller test"
   },
   "keywords": [
     "github-action",

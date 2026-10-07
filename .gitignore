@@ -1,4 +1,6 @@
 node_modules/
+controller/node_modules/
+controller/dist/
 .worktrees/
 skills-lock.json
 *.log

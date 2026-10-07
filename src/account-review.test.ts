@@ -313,7 +313,7 @@ describe("runAccountReview", () => {
       isInteractive: false,
       env: { LLM_API_KEY: key, LLM_BASE_URL: baseUrl, LLM_MODEL: model },
     });
-    expect(gh.listOrganizationSecrets).toHaveBeenCalledTimes(2);
+    expect(gh.listOrganizationSecrets).toHaveBeenCalledTimes(4);
     expect(gh.setOrganizationSecret).toHaveBeenCalledTimes(3);
     expect(gh.setOrganizationSecret.mock.calls[0][1].map(({ name }: any) => name)).toEqual(["alpha", "beta"]);
     expect(lines.join("\n")).not.toContain(key);
@@ -333,7 +333,7 @@ describe("runAccountReview", () => {
       env: { LLM_API_KEY: "key-value", LLM_BASE_URL: "url-value", LLM_MODEL: "model-value" },
     });
     expect(gh.createWorkflow).not.toHaveBeenCalled();
-    expect(gh.listOrganizationSecrets).toHaveBeenCalledTimes(2);
+    expect(gh.listOrganizationSecrets).toHaveBeenCalledTimes(4);
     expect(gh.setOrganizationSecret).toHaveBeenCalledTimes(3);
   });
 
@@ -392,11 +392,13 @@ describe("runAccountReview", () => {
     expect(execFile.mock.calls[0][2].env).toEqual({ GH_TOKEN: "gh-auth-token", PATH: "/usr/bin" });
   });
 
-  it("rechecks secret names immediately before writes to preserve newly-created values", async () => {
+  it("rechecks secret names before every write to preserve newly-created values", async () => {
     const gh = createGh({
       listOrganizationSecrets: jest.fn()
         .mockResolvedValueOnce([])
-        .mockResolvedValueOnce(["LLM_API_KEY"]),
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(["LLM_API_KEY", "LLM_BASE_URL"])
+        .mockResolvedValueOnce(["LLM_API_KEY", "LLM_BASE_URL"]),
     });
     const plan = await runAccountReview(["--org", "acme", "--mode", "all", "--yes"], {
       gh,
@@ -405,8 +407,12 @@ describe("runAccountReview", () => {
       isInteractive: false,
       env: { LLM_API_KEY: "key-value", LLM_BASE_URL: "url-value", LLM_MODEL: "model-value" },
     });
-    expect(gh.listOrganizationSecrets).toHaveBeenCalledTimes(2);
+    expect(gh.listOrganizationSecrets).toHaveBeenCalledTimes(4);
     expect(gh.setOrganizationSecret).toHaveBeenCalledTimes(2);
+    expect(gh.setOrganizationSecret.mock.calls.map((call: any[]) => call[2])).toEqual([
+      "LLM_API_KEY",
+      "LLM_MODEL",
+    ]);
     expect(plan.secrets.skipped).toBe(1);
   });
 

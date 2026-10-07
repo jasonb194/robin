@@ -286,20 +286,14 @@ async function executeSecretPlan(options, secretPlan, gh, write) {
   let configured = 0;
   let failed = 0;
   let skipped = secretPlan.skipped;
-  const checkedScopes = new Map();
   for (const operation of secretPlan.operations) {
     try {
-      // `gh secret set` is an upsert. Check again before writing each scope's
-      // planned secrets to reduce the window in which a concurrent secret
-      // change could be replaced.
-      const scopeKey = operation.scope === "org" ? `org:${options.target}` : `repo:${operation.repository.full_name}`;
-      if (!checkedScopes.has(scopeKey)) {
-        const names = operation.scope === "org"
-          ? await gh.listOrganizationSecrets(options.target)
-          : await gh.listRepositorySecrets(operation.repository);
-        checkedScopes.set(scopeKey, new Set(names));
-      }
-      const existing = checkedScopes.get(scopeKey);
+      // `gh secret set` is an upsert. Refresh immediately before every write
+      // so later operations do not reuse an earlier scope snapshot.
+      const names = operation.scope === "org"
+        ? await gh.listOrganizationSecrets(options.target)
+        : await gh.listRepositorySecrets(operation.repository);
+      const existing = new Set(names);
       if (existing.has(operation.name)) {
         skipped += 1;
         continue;
@@ -309,7 +303,6 @@ async function executeSecretPlan(options, secretPlan, gh, write) {
       } else {
         await gh.setRepositorySecret(operation.repository, operation.name, operation.value);
       }
-      existing.add(operation.name);
       configured += 1;
     } catch (error) {
       failed += 1;
