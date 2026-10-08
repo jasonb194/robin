@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.10.0](https://github.com/jasonb194/robin/compare/v2.9.0...v2.10.0) (2026-10-08)
+
+
+### Features
+
+* add account-level GitHub App review controller ([775b0bc](https://github.com/jasonb194/robin/commit/775b0bc78dc6d956e6cdcde29afa10766fb4a386))
+* add account-level GitHub App review controller ([69f7f6b](https://github.com/jasonb194/robin/commit/69f7f6b512f0a3af4cebb8dc766baa8351ec7239))
+* bootstrap Robin review across GitHub accounts ([030f5f2](https://github.com/jasonb194/robin/commit/030f5f217600652379c74173b1c2dede8407354a))
+* support Cloudflare Access service tokens ([3e191f2](https://github.com/jasonb194/robin/commit/3e191f29e169ca00f1813eb33296b906322d767f))
+
+
+### Bug Fixes
+
+* **controller:** avoid deleting secrets on ownership failure ([b55cb37](https://github.com/jasonb194/robin/commit/b55cb37279a3a2fd2534abbf33cd1f10d1b413ad))
+* harden account controller reconciliation ([c5078bc](https://github.com/jasonb194/robin/commit/c5078bcaeba9b6830be17334b8e6e646f490acf6))
+* keep Access credentials off loopback HTTP proxies ([cf5eb9a](https://github.com/jasonb194/robin/commit/cf5eb9a56dff09df02b7713cd843d36e9f2b9691))
+* redact Cloudflare Access client IDs ([61a7404](https://github.com/jasonb194/robin/commit/61a74040edcb6fd4c754b4b49a08c6afb00a526e))
+* redact credentials from assembled streams ([398eb12](https://github.com/jasonb194/robin/commit/398eb12d0760cfef4c3dc0fe49d711c11c74c22b))
+* update vulnerable form-data dependency ([3b33bf0](https://github.com/jasonb194/robin/commit/3b33bf0313bec65356a8a94d2e51fba8fae417a7))
+
+
+### Documentation
+
+* add JSDoc for account bootstrap and GitHub App controller functions ([e3469b1](https://github.com/jasonb194/robin/commit/e3469b17f90a65d2bfca2d82edd2ef1950e9f780))
+* clarify Access credential safeguards ([1b77daf](https://github.com/jasonb194/robin/commit/1b77daf9600569a6701ea8dcfb57f6e769d67b21))
+* clarify credential handling boundaries ([97568f1](https://github.com/jasonb194/robin/commit/97568f129f11ea86924a3e51e72c00ae4b874203))
+
 ## [2.9.0](https://github.com/antongulin/robin/compare/v2.8.0...v2.9.0) (2026-10-01)
 
 
