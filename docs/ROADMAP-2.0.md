@@ -25,8 +25,10 @@ The project is already at **v1.3.0**, so this is not a "1.0" — it's the road t
 
 ## Design principles (apply to every phase)
 
-1. **Protect the wedge.** Zero marginal cost, zero lock-in, runs in the user's own
-   repo. Never add anything that requires a hosted service or a paid tier.
+1. **Protect the wedge.** Keep the default Action path BYOK, free, and running in the
+   user's own repositories. An optional account-level GitHub App controller supports
+   one-time enrollment, but it is self-hosted: Robin does not provide a hosted service or
+   require a paid tier.
 2. **Assume the model is weak and random.** Every prompt/scaffolding decision is
    judged by: does it make a dumb, rotating free model produce a *consistent, low-noise*
    review? Robustness > cleverness.

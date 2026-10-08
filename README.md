@@ -76,6 +76,111 @@ Prefer to do it by hand, or read the installer first? It's
 [bin/robin-review.js](bin/robin-review.js) (npm) / [scripts/install.sh](scripts/install.sh)
 (curl) — or follow the manual 3 steps instead.
 
+### Install once for an organization or user account
+
+For ongoing account-level setup, install the Robin GitHub App once on an organization or
+user account. The controller applies your repository policy to repositories the App can
+access, including repositories created later. Robin does not host this controller; you
+must deploy it on your own server with a public HTTPS URL and PostgreSQL. See the
+[GitHub App controller setup](docs/ADVANCED.md#github-app-account-controller) for App
+registration, permissions, deployment, and operations.
+
+During setup, choose one policy:
+
+- `all`: review every eligible repository.
+- `none`: configure no repositories.
+- `all-but`: review every eligible repository except matching names.
+- `only`: review only matching names.
+
+Selectors can match an exact repository name (case-insensitive) or a repository name with
+a regex. The App needs access to all repositories in the account for `all` and for new
+repositories to be discovered; the saved policy decides which repositories receive Robin's
+workflow.
+
+The self-hosted controller writes a managed workflow and adds repository Actions secrets
+under reserved `ROBIN_ACCOUNT_*` names; existing standard `LLM_*` secrets are preserved.
+If a reserved name exists without a Robin ownership record, setup for that repository stops;
+remove or rename that secret manually before retrying. See the
+[secret ownership and recovery details](docs/ADVANCED.md#workflow-and-secret-behavior).
+It writes directly to each repository's default branch when allowed; if branch protection
+or repository rules block that write, it opens a setup pull request for review. When a
+repository stops matching, it removes only an unchanged workflow it manages and the
+`ROBIN_ACCOUNT_*` secrets it created. Uninstalling or suspending the App can leave existing
+workflows running; remove those workflows and any remaining secrets manually if you want to
+stop reviews. Removing a repository from the App's access can also leave its workflow and
+secrets behind. Use HTTPS for external LLM endpoints.
+
+### One-time bulk setup (CLI alternative)
+
+If you do not want to operate a GitHub App controller, the npm installer can bootstrap the
+repositories currently accessible to an organization or owned by a user. This is a
+one-time operation; it provisions repositories separately and does not enroll future
+repositories automatically. Run it with GitHub CLI (`gh`) authenticated to an account that
+can access the target repositories:
+
+```bash
+npx robin-review --org YOUR_ORG --mode all
+# Or, for your own user account (the login must match `gh auth status`):
+npx robin-review --user YOUR_GITHUB_LOGIN --mode all
+```
+
+The installer lists repositories currently accessible in that organization or owned by
+that user, previews the selected repositories, and asks before making changes. It adds
+`.github/workflows/robin.yml` to active repositories that do not already have a file at
+that path. Archived repositories and repositories without a default branch are skipped;
+an existing workflow at that path is preserved. Use `--dry-run` to preview without
+changes, or `--yes` to skip the final confirmation.
+
+Choose which repositories to include with `--mode all`, `--mode none`, `--mode all-but`,
+or `--mode only`. `all-but` and `only` take one or more `--select` values. Names match
+repository names case-insensitively; `regex:` selectors use RE2 syntax and match part of
+the repository name:
+
+```bash
+# Review every eligible repository
+npx robin-review --org YOUR_ORG --mode all
+
+# Review none (no repositories are changed)
+npx robin-review --org YOUR_ORG --mode none
+
+# Review all except these repositories
+npx robin-review --org YOUR_ORG --mode all-but \
+  --select name:website --select regex:^archive-
+
+# Review only matching repositories
+npx robin-review --org YOUR_ORG --mode only \
+  --select name:api --select regex:^service-
+```
+
+If you omit `--mode` in an interactive terminal, the installer asks which policy to use.
+In non-interactive runs, pass `--mode`; `all-but` and `only` also require explicit
+`--select` values.
+
+The installer can add missing Actions secrets after workflow setup. For an organization,
+it adds each missing organization secret once and scopes it to repositories where Robin's
+workflow is current or was installed successfully. For a user account, it adds missing
+repository secrets separately in each such repository. It checks secret names immediately
+before setup and skips names already present. GitHub secret writes replace a value by
+name, so a concurrent admin change between that check and the write can still race;
+coordinate simultaneous secret setup. You can enter missing LLM values at the hidden
+prompts or provide them through environment variables. Optional Cloudflare Access
+credentials are read from environment variables; provide both values if both secrets
+are missing. Use `--skip-secrets` to leave secrets unchanged; add them later in GitHub
+Settings.
+
+For a non-interactive run, provide environment values for any missing secrets and `--yes`,
+or use `--skip-secrets`:
+
+```bash
+LLM_API_KEY='…' LLM_BASE_URL='https://openrouter.ai/api/v1' LLM_MODEL='openrouter/free' \
+  npx robin-review --org YOUR_ORG --mode all --yes
+```
+
+The GitHub CLI needs permission to list and update the selected repositories. Adding
+organization Actions secrets also requires permission to manage organization Actions
+secrets. See [account bootstrap details](docs/ADVANCED.md#account-level-bootstrap) for
+the full behavior and limitations.
+
 ## Setup in 3 steps
 
 ### Step 1 — Get an API key (free option)

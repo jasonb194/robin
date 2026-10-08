@@ -1,9 +1,12 @@
 node_modules/
+controller/node_modules/
+controller/dist/
 .worktrees/
 skills-lock.json
 *.log
 .env
 .env.*
+!controller/.env.example
 coverage/
 .DS_Store
 .idea/

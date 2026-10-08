@@ -12,6 +12,14 @@ const fs = require("fs");
 const path = require("path");
 const cp = require("child_process");
 
+const accountArgs = process.argv.slice(2);
+if (accountArgs.some((arg) => ["--org", "--user", "--mode", "--select", "--dry-run", "--yes", "--skip-secrets", "--help", "-h"].includes(arg))) {
+  require("./account-review").runAccountReview(accountArgs).catch((error) => {
+    console.error(`Robin account bootstrap failed: ${error.message || String(error)}`);
+    process.exitCode = 1;
+  });
+} else {
+
 const info = (msg) => console.log("\x1b[0;32m🏹 " + msg + "\x1b[0m");
 const warn = (msg) => console.log("\x1b[0;33m🏹 " + msg + "\x1b[0m");
 const die = (msg) => {
@@ -189,4 +197,5 @@ if (isRobinSourceRepository) {
 
   Docs: https://github.com/antongulin/robin#readme
 `);
+}
 }

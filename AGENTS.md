@@ -91,7 +91,8 @@ task records outside the tracked tree.
 `action.yml` is the action input/output contract; `.github/workflows/review.yml` is the
 reusable workflow consumers call; `templates/robin.yml`, `scripts/install.sh`, and
 `bin/robin-review.js` are the shipped installer surfaces; `docs/` and `README.md` are the
-user documentation; `skills/robin/` is the companion chat skill shipped for coding agents.
+user documentation; `skills/robin/` is the companion chat skill shipped for coding agents;
+`controller/` is the separately deployed GitHub App account controller.
 
 | Path | Owns |
 | --- | --- |
@@ -101,6 +102,10 @@ user documentation; `skills/robin/` is the companion chat skill shipped for codi
 | `src/agent-review.ts`, `src/review-tools.ts`, `src/repo-snapshot.ts` | Multi-turn agent review and its read-only tools |
 | `src/prompts/`, `src/review-parser.ts` | Review prompts, JSON schema, response parsing |
 | `action.yml`, `.github/workflows/review.yml` | Action inputs and reusable-workflow schema (forwarded 1:1) |
+| `bin/robin-review.js`, `bin/account-review.js`, `bin/repo-selection.js` | Per-repository installer dispatch, account bootstrap, and repository selection policy |
+| `controller/src/` | GitHub App OAuth/setup, webhook handling, account policy, repository reconciliation, credential encryption, and PostgreSQL queue |
+| `controller/src/managed-secret.ts`, `controller/src/reconcile-phases.ts`, `controller/src/workflow-template.ts` | Secret creation/ownership recovery, independently reported repository reconciliation, and managed workflow template loading |
+| `controller/Dockerfile`, `controller/docker-compose.yml`, `controller/.env.example` | Self-hosted controller deployment surfaces; the project does not run a hosted controller |
 | `docs/`, `README.md`, `llms.txt` | User-facing setup, behavior, and troubleshooting |
 
 **Documentation ownership.** This root `AGENTS.md` is the documentation contract for the whole
@@ -120,12 +125,19 @@ npm run lint             # eslint src/**/*.ts
 npx --no-install tsc --noEmit
 actionlint -shellcheck= -pyflakes= .github/workflows/*.yml testdata/consumer-workflows/*.yml
 npm run build            # tsc + ncc; commit the regenerated dist/index.js
+(cd controller && npm ci && npm test) # isolated GitHub App controller build and tests
 ```
 
 Keep action inputs, reusable-workflow `workflow_call` inputs, the `with:` forwarding in
 `review.yml`, the installer template, and the docs in sync — `src/workflow.test.ts` guards
 that parity. Behavior changes that touch optional request parameters should not silently
 drop a user-configured control; surface the provider error instead.
+
+The npm installer supports per-repository setup and an account-level bulk bootstrap. The
+separately deployed `controller/` GitHub App supports ongoing account-level enrollment.
+Keep `bin/account-review.js` behavior and options, and the controller's policy/deployment
+contracts, in sync with `README.md` and `docs/ADVANCED.md`. The CLI bootstrap updates
+currently accessible repositories only; it does not enroll repositories created later.
 
 ## Maintainers: release-notes upkeep (automatic)
 

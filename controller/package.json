@@ -1,0 +1,25 @@
+{
+  "name": "@robin-review/account-controller",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted GitHub App control plane for Robin Actions",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@octokit/auth-app": "^7.2.1",
+    "@octokit/rest": "^21.1.1",
+    "fastify": "^5.2.1",
+    "libsodium-wrappers": "^0.7.15",
+    "pg": "^8.13.1",
+    "re2js": "^2.8.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/pg": "^8.11.11",
+    "typescript": "^5.7.3"
+  }
+}
